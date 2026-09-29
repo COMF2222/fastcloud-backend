@@ -102,6 +102,21 @@ class BrokerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             server.profile_slug("https://example.com/owner")
 
+    @patch.object(server, "soundcloud")
+    def test_owner_connects_and_keeps_access_after_profile_rename(self, soundcloud):
+        slug = ["owner"]
+        def reply(url, *, token=None, form=None):
+            if url.endswith("/me"):
+                return {"urn": "soundcloud:users:1", "username": "Owner", "permalink": slug[0]}
+            return {"access_token": "owner", "refresh_token": "next", "expires_in": 3600}
+        soundcloud.side_effect = reply
+        status, result = self.call("/v1/oauth/exchange", {"code": "abc", "verifier": "v" * 43})
+        self.assertEqual((status, result["access_token"]), (200, "owner"))
+        self.assertEqual(server.admin_id(), 1)
+        slug[0] = "new-owner-name"
+        status, result = self.call("/v1/oauth/refresh", {"refresh_token": "next"})
+        self.assertEqual((status, result["access_token"]), (200, "owner"))
+
 
 if __name__ == "__main__":
     unittest.main()
