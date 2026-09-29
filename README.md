@@ -11,19 +11,18 @@ released once after the owner approves. The desktop app waits automatically.
 
 1. Register your SoundCloud API app with redirect URI
    `http://127.0.0.1:41317/callback` (or set the exact URI in `.env`).
-2. Copy `.env.example` to `.env`, enter your app ID and secret. The owner profile
-   URL is prefilled from the provided SoundCloud link; check that it is the
-   account that owns the API app. Tracking query parameters are unnecessary.
-   Never commit `.env`.
+2. Copy `.env.example` to `.env`, enter your app ID and secret, and replace
+   `SOUNDCLOUD_ADMIN_PROFILE_URL` with the profile URL of the account that owns
+   the API app. Tracking query parameters are unnecessary. Never commit `.env`.
 3. For a domain, point its DNS A/AAAA record at the server and set
    `FASTCLOUD_DOMAIN` in `.env`; run `docker compose up -d --build`.
    For a direct IPv4 address, set `FASTCLOUD_PUBLIC_IP` in `.env` and run
    `docker compose -f compose.ip.yaml up -d --build`. Both modes require inbound
    ports 80 and 443. The IP mode uses Certbot 5.8 to obtain and renew a public
    short-lived Let's Encrypt IP certificate; the domain mode uses Caddy.
-4. Check `https://<domain-or-ip>/health` and enter that HTTPS URL in Fastcloud's
-   Account settings. Local HTTP is allowed only for `localhost`/`127.0.0.1`
-   development.
+4. Check `https://<domain-or-ip>/health`. Distributed Fastcloud builds use the
+   built-in server URL; users do not enter it in Account settings. Local HTTP is
+   allowed only for `localhost`/`127.0.0.1` development.
 
 The Docker volume `approvals` holds the SQLite allowlist and must be backed up.
 Keep `.env` and the volume when updating the container. On the owner's first
