@@ -53,10 +53,17 @@ class BrokerTest(unittest.TestCase):
         body = json.dumps({"error": f"invalid_grant {server.CLIENT_SECRET} abc"}).encode()
         urlopen.side_effect = urllib.error.HTTPError(
             "https://secure.soundcloud.com/oauth/token", 403, "Forbidden", {}, io.BytesIO(body))
-        with self.assertRaisesRegex(ValueError, "token exchange returned HTTP 403") as caught:
+        with self.assertRaisesRegex(server.UpstreamError, "token exchange returned HTTP 403") as caught:
             server.soundcloud("https://secure.soundcloud.com/oauth/token", form={"code": "abc"})
         self.assertNotIn(server.CLIENT_SECRET, str(caught.exception))
         self.assertNotIn("abc", str(caught.exception))
+
+    @patch.object(server, "soundcloud")
+    def test_admin_profile_upstream_failure_is_not_reported_as_bad_request(self, soundcloud):
+        soundcloud.side_effect = server.UpstreamError("SoundCloud profile lookup returned HTTP 403: forbidden")
+        status, result = self.call("/v1/admin/users", token="owner")
+        self.assertEqual(status, 502)
+        self.assertEqual(result["error"], "SoundCloud profile lookup returned HTTP 403: forbidden")
 
     @patch.object(server, "soundcloud")
     def test_approval_and_revocation(self, soundcloud):

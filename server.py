@@ -40,6 +40,10 @@ PENDING = {}
 PENDING_SECONDS = 15 * 60
 
 
+class UpstreamError(Exception):
+    """A SoundCloud request failed; the client did not send a malformed request."""
+
+
 @contextmanager
 def database():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -82,7 +86,7 @@ def soundcloud(url, *, token=None, form=None):
             response = {}
         if not isinstance(response, dict):
             response = {}
-        detail = response.get("error") or response.get("error_description") or response.get("message")
+        detail = response.get("error_description") or response.get("error") or response.get("message")
         if not isinstance(detail, str):
             detail = ""
         for sensitive in (CLIENT_ID, CLIENT_SECRET, token, (form or {}).get("code"),
@@ -91,7 +95,7 @@ def soundcloud(url, *, token=None, form=None):
                 detail = detail.replace(sensitive, "[redacted]")
         detail = " ".join(detail.split())[:180]
         suffix = f": {detail}" if detail else ""
-        raise ValueError(f"SoundCloud {stage} returned HTTP {error.code}{suffix}") from None
+        raise UpstreamError(f"SoundCloud {stage} returned HTTP {error.code}{suffix}") from None
 
 
 def profile(token):
@@ -284,6 +288,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(404, {"error": "Unknown endpoint"})
         except PermissionError as error:
             return self.reply(403, {"error": str(error)})
+        except UpstreamError as error:
+            return self.reply(502, {"error": str(error)})
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
             return self.reply(400, {"error": str(error)})
         except Exception:
