@@ -50,6 +50,7 @@ def database():
         "status TEXT NOT NULL CHECK(status IN ('pending','approved','denied')), "
         "updated_at INTEGER NOT NULL)"
     )
+    connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     connection.commit()
     try:
         yield connection
@@ -87,8 +88,25 @@ def profile(token):
     return int(user_id), str(result["username"])[:200], str(permalink or "").lower()
 
 
+def admin_id():
+    with DB_LOCK, database() as db:
+        row = db.execute("SELECT value FROM metadata WHERE key='admin_id'").fetchone()
+    return int(row[0]) if row else None
+
+
+def is_admin(user_id, slug):
+    with DB_LOCK, database() as db:
+        row = db.execute("SELECT value FROM metadata WHERE key='admin_id'").fetchone()
+        if row:
+            return int(row[0]) == user_id
+        if slug != ADMIN_SLUG:
+            return False
+        db.execute("INSERT INTO metadata (key, value) VALUES ('admin_id', ?)", (str(user_id),))
+        return True
+
+
 def allowed(user_id, username, slug):
-    if slug == ADMIN_SLUG:
+    if is_admin(user_id, slug):
         return True
     with DB_LOCK, database() as db:
         row = db.execute("SELECT status FROM users WHERE id=?", (user_id,)).fetchone()
@@ -163,8 +181,8 @@ class Handler(BaseHTTPRequestHandler):
         authorization = self.headers.get("Authorization", "")
         if not authorization.startswith("OAuth "):
             raise PermissionError("Sign in to the owner SoundCloud account")
-        _, _, slug = profile(authorization[6:])
-        if slug != ADMIN_SLUG:
+        user_id, _, slug = profile(authorization[6:])
+        if not is_admin(user_id, slug):
             raise PermissionError("Owner account required")
 
     def handle_request(self):
@@ -238,7 +256,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.admin()
                 user_id = int(path.removeprefix("/v1/admin/users/"))
                 status = self.body().get("status")
-                if status not in ("approved", "denied", "pending"):
+                if user_id == admin_id() or status not in ("approved", "denied", "pending"):
                     raise ValueError("Invalid user or status")
                 with DB_LOCK, database() as db:
                     changed = db.execute("UPDATE users SET status=?, updated_at=? WHERE id=?", (status, int(time.time()), user_id)).rowcount

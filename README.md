@@ -24,8 +24,11 @@ released once after the owner approves. The desktop app waits automatically.
    development.
 
 The Docker volume `approvals` holds the SQLite allowlist and must be backed up.
-Keep `.env` and the volume when updating the container. The server compares the
-authenticated `/me` permalink with `SOUNDCLOUD_ADMIN_PROFILE_URL`. Administrators
+Keep `.env` and the volume when updating the container. On the owner's first
+authenticated request, the server matches the `/me` permalink to
+`SOUNDCLOUD_ADMIN_PROFILE_URL` and saves the stable numeric SoundCloud user ID.
+Future checks use that ID, so changing the profile name or URL keeps admin
+access. Back up the volume: it holds this ID as well as the allowlist. Administrators
 sign in to Fastcloud with that account and approve users in Account settings.
 
 Before public distribution, review SoundCloud's current API Terms of Use and

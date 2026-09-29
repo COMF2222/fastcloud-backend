@@ -17,6 +17,10 @@ import server
 
 class BrokerTest(unittest.TestCase):
     def setUp(self):
+        with server.PENDING_LOCK:
+            server.PENDING.clear()
+        with server.RATE_LOCK:
+            server.RATE.clear()
         self.temp = tempfile.TemporaryDirectory()
         server.DB_PATH = Path(self.temp.name) / "approvals.sqlite3"
         self.http = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
@@ -45,11 +49,12 @@ class BrokerTest(unittest.TestCase):
 
     @patch.object(server, "soundcloud")
     def test_approval_and_revocation(self, soundcloud):
+        owner_slug = ["owner"]
         def reply(url, *, token=None, form=None):
             if url.endswith("/me"):
-                return {"id": 1 if token == "owner" else 42,
+                return {"id": 1 if token == "owner" else 99 if token == "imposter" else 42,
                         "username": "Owner" if token == "owner" else "Listener",
-                        "permalink": "owner" if token == "owner" else "listener"}
+                        "permalink": owner_slug[0] if token == "owner" else "owner" if token == "imposter" else "listener"}
             return {"access_token": "user", "refresh_token": "next", "expires_in": 3600}
         soundcloud.side_effect = reply
         payload = {"code": "abc", "verifier": "v" * 43}
@@ -61,6 +66,10 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(self.call("/v1/admin/users")[0], 403)
         status, result = self.call("/v1/admin/users", token="owner")
         self.assertEqual((status, result["users"][0]["status"]), (200, "pending"))
+        self.assertEqual(server.admin_id(), 1)
+        owner_slug[0] = "new-owner-name"
+        self.assertEqual(self.call("/v1/admin/users", token="owner")[0], 200)
+        self.assertEqual(self.call("/v1/admin/users", token="imposter")[0], 403)
         self.assertEqual(self.call("/v1/admin/users/42", {"status": "approved"}, "owner")[0], 200)
         status, result = self.call("/v1/oauth/pending", {"ticket": ticket})
         self.assertEqual((status, result["access_token"]), (200, "user"))
@@ -69,6 +78,29 @@ class BrokerTest(unittest.TestCase):
         status, result = self.call("/v1/oauth/refresh", {"refresh_token": "next"})
         self.assertEqual(status, 403)
         self.assertNotIn("access_token", result)
+
+    @patch.object(server, "soundcloud")
+    def test_denied_pending_token_is_never_released(self, soundcloud):
+        def reply(url, *, token=None, form=None):
+            if url.endswith("/me"):
+                return {"id": 1 if token == "owner" else 42,
+                        "username": "Owner" if token == "owner" else "Listener",
+                        "permalink": "owner" if token == "owner" else "listener"}
+            return {"access_token": "user", "refresh_token": "next", "expires_in": 3600}
+        soundcloud.side_effect = reply
+        _, result = self.call("/v1/oauth/exchange", {"code": "abc", "verifier": "v" * 43})
+        ticket = result["ticket"]
+        self.assertEqual(self.call("/v1/admin/users/42", {"status": "denied"}, "owner")[0], 200)
+        status, result = self.call("/v1/oauth/pending", {"ticket": ticket})
+        self.assertEqual(status, 403)
+        self.assertNotIn("access_token", result)
+        self.assertNotIn(ticket, server.PENDING)
+        self.assertEqual(self.call("/v1/oauth/exchange", {"code": "abc", "verifier": "v" * 43})[0], 403)
+
+    def test_profile_link_uses_path_not_tracking_parameter(self):
+        self.assertEqual(server.profile_slug("https://soundcloud.com/owner?utm_source=id_335378"), "owner")
+        with self.assertRaises(ValueError):
+            server.profile_slug("https://example.com/owner")
 
 
 if __name__ == "__main__":
