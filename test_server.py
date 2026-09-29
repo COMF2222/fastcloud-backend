@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import tempfile
 import threading
@@ -46,6 +47,16 @@ class BrokerTest(unittest.TestCase):
         except urllib.error.HTTPError as error:
             with error:
                 return error.code, json.load(error)
+
+    @patch.object(server.urllib.request, "urlopen")
+    def test_upstream_error_identifies_stage_and_redacts_credentials(self, urlopen):
+        body = json.dumps({"error": f"invalid_grant {server.CLIENT_SECRET} abc"}).encode()
+        urlopen.side_effect = urllib.error.HTTPError(
+            "https://secure.soundcloud.com/oauth/token", 403, "Forbidden", {}, io.BytesIO(body))
+        with self.assertRaisesRegex(ValueError, "token exchange returned HTTP 403") as caught:
+            server.soundcloud("https://secure.soundcloud.com/oauth/token", form={"code": "abc"})
+        self.assertNotIn(server.CLIENT_SECRET, str(caught.exception))
+        self.assertNotIn("abc", str(caught.exception))
 
     @patch.object(server, "soundcloud")
     def test_approval_and_revocation(self, soundcloud):

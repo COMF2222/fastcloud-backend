@@ -75,7 +75,23 @@ def soundcloud(url, *, token=None, form=None):
         with urllib.request.urlopen(request, timeout=15) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
-        raise ValueError(f"SoundCloud returned HTTP {error.code}") from None
+        stage = "token exchange" if url.endswith("/oauth/token") else "profile lookup"
+        try:
+            response = json.loads(error.read(2048))
+        except (ValueError, UnicodeDecodeError):
+            response = {}
+        if not isinstance(response, dict):
+            response = {}
+        detail = response.get("error") or response.get("error_description") or response.get("message")
+        if not isinstance(detail, str):
+            detail = ""
+        for sensitive in (CLIENT_ID, CLIENT_SECRET, token, (form or {}).get("code"),
+                          (form or {}).get("code_verifier"), (form or {}).get("refresh_token")):
+            if sensitive:
+                detail = detail.replace(sensitive, "[redacted]")
+        detail = " ".join(detail.split())[:180]
+        suffix = f": {detail}" if detail else ""
+        raise ValueError(f"SoundCloud {stage} returned HTTP {error.code}{suffix}") from None
 
 
 def profile(token):
