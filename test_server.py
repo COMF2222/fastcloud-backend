@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("SOUNDCLOUD_CLIENT_ID", "test-client")
 os.environ.setdefault("SOUNDCLOUD_CLIENT_SECRET", "test-secret")
-os.environ.setdefault("SOUNDCLOUD_ADMIN_ID", "1")
+os.environ.setdefault("SOUNDCLOUD_ADMIN_PROFILE_URL", "https://soundcloud.com/owner")
 import server
 
 
@@ -48,19 +48,23 @@ class BrokerTest(unittest.TestCase):
         def reply(url, *, token=None, form=None):
             if url.endswith("/me"):
                 return {"id": 1 if token == "owner" else 42,
-                        "username": "Owner" if token == "owner" else "Listener"}
+                        "username": "Owner" if token == "owner" else "Listener",
+                        "permalink": "owner" if token == "owner" else "listener"}
             return {"access_token": "user", "refresh_token": "next", "expires_in": 3600}
         soundcloud.side_effect = reply
         payload = {"code": "abc", "verifier": "v" * 43}
         status, result = self.call("/v1/oauth/exchange", payload)
         self.assertEqual((status, result["status"]), (202, "pending"))
         self.assertNotIn("access_token", result)
+        ticket = result["ticket"]
+        self.assertEqual(self.call("/v1/oauth/pending", {"ticket": ticket})[0], 202)
         self.assertEqual(self.call("/v1/admin/users")[0], 403)
         status, result = self.call("/v1/admin/users", token="owner")
         self.assertEqual((status, result["users"][0]["status"]), (200, "pending"))
         self.assertEqual(self.call("/v1/admin/users/42", {"status": "approved"}, "owner")[0], 200)
-        status, result = self.call("/v1/oauth/exchange", payload)
+        status, result = self.call("/v1/oauth/pending", {"ticket": ticket})
         self.assertEqual((status, result["access_token"]), (200, "user"))
+        self.assertEqual(self.call("/v1/oauth/pending", {"ticket": ticket})[0], 410)
         self.assertEqual(self.call("/v1/admin/users/42", {"status": "denied"}, "owner")[0], 200)
         status, result = self.call("/v1/oauth/refresh", {"refresh_token": "next"})
         self.assertEqual(status, 403)

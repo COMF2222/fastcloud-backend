@@ -2,6 +2,7 @@
 
 import json
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -16,13 +17,27 @@ from contextlib import contextmanager
 CLIENT_ID = os.environ["SOUNDCLOUD_CLIENT_ID"]
 CLIENT_SECRET = os.environ["SOUNDCLOUD_CLIENT_SECRET"]
 REDIRECT_URI = os.environ.get("SOUNDCLOUD_REDIRECT_URI", "http://127.0.0.1:41317/callback")
-ADMIN_ID = int(os.environ["SOUNDCLOUD_ADMIN_ID"])
+
+
+def profile_slug(value):
+    parsed = urllib.parse.urlsplit(value.strip())
+    parts = parsed.path.strip("/").split("/")
+    if (parsed.scheme != "https" or parsed.hostname not in ("soundcloud.com", "www.soundcloud.com")
+            or len(parts) != 1 or not parts[0]):
+        raise ValueError("Use a SoundCloud profile URL, for example https://soundcloud.com/name")
+    return parts[0].lower()
+
+
+ADMIN_SLUG = profile_slug(os.environ["SOUNDCLOUD_ADMIN_PROFILE_URL"])
 DB_PATH = Path(os.environ.get("FASTCLOUD_DB_PATH", "/data/approvals.sqlite3"))
 HOST = os.environ.get("FASTCLOUD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("FASTCLOUD_PORT", "8080"))
 DB_LOCK = threading.Lock()
 RATE_LOCK = threading.Lock()
 RATE = {}
+PENDING_LOCK = threading.Lock()
+PENDING = {}
+PENDING_SECONDS = 15 * 60
 
 
 @contextmanager
@@ -64,11 +79,16 @@ def soundcloud(url, *, token=None, form=None):
 
 def profile(token):
     result = soundcloud("https://api.soundcloud.com/me", token=token)
-    return int(result["id"]), str(result["username"])[:200]
+    urn = str(result.get("urn", ""))
+    user_id = result.get("id") or urn.rsplit(":", 1)[-1]
+    permalink = result.get("permalink")
+    if not permalink and result.get("permalink_url"):
+        permalink = profile_slug(result["permalink_url"])
+    return int(user_id), str(result["username"])[:200], str(permalink or "").lower()
 
 
-def allowed(user_id, username):
-    if user_id == ADMIN_ID:
+def allowed(user_id, username, slug):
+    if slug == ADMIN_SLUG:
         return True
     with DB_LOCK, database() as db:
         row = db.execute("SELECT status FROM users WHERE id=?", (user_id,)).fetchone()
@@ -80,6 +100,26 @@ def allowed(user_id, username):
             db.execute("UPDATE users SET username=? WHERE id=?", (username, user_id))
             db.commit()
         return row[0] == "approved"
+
+
+def approval_status(user_id):
+    with DB_LOCK, database() as db:
+        row = db.execute("SELECT status FROM users WHERE id=?", (user_id,)).fetchone()
+    return row[0] if row else "pending"
+
+
+def pending_ticket(user_id, tokens):
+    ticket = secrets.token_urlsafe(32)
+    with PENDING_LOCK:
+        now = time.monotonic()
+        for key, value in list(PENDING.items()):
+            if value["expires_at"] <= now:
+                del PENDING[key]
+        if len(PENDING) >= 1000:
+            raise ValueError("Too many pending connections")
+        PENDING[ticket] = {"user_id": user_id, "tokens": tokens, "created_at": now,
+                           "expires_at": now + PENDING_SECONDS}
+    return ticket
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -123,8 +163,8 @@ class Handler(BaseHTTPRequestHandler):
         authorization = self.headers.get("Authorization", "")
         if not authorization.startswith("OAuth "):
             raise PermissionError("Sign in to the owner SoundCloud account")
-        user_id, _ = profile(authorization[6:])
-        if user_id != ADMIN_ID:
+        _, _, slug = profile(authorization[6:])
+        if slug != ADMIN_SLUG:
             raise PermissionError("Owner account required")
 
     def handle_request(self):
@@ -146,9 +186,36 @@ class Handler(BaseHTTPRequestHandler):
                     "client_secret": CLIENT_SECRET, "redirect_uri": REDIRECT_URI,
                     "code_verifier": verifier, "code": code,
                 })
-                user_id, username = profile(tokens["access_token"])
-                if not allowed(user_id, username):
-                    return self.reply(202, {"status": "pending", "message": "Access request recorded. Ask the owner to approve it, then connect again."})
+                user_id, username, slug = profile(tokens["access_token"])
+                if not allowed(user_id, username, slug):
+                    if approval_status(user_id) == "denied":
+                        return self.reply(403, {"error": "Access was denied by the owner"})
+                    ticket = pending_ticket(user_id, tokens)
+                    return self.reply(202, {"status": "pending", "ticket": ticket,
+                                            "message": "Waiting for owner approval"})
+                return self.reply(200, tokens)
+            if self.command == "POST" and path == "/v1/oauth/pending":
+                ticket = self.body().get("ticket")
+                if not isinstance(ticket, str) or len(ticket) != 43:
+                    raise ValueError("Invalid pending ticket")
+                with PENDING_LOCK:
+                    entry = PENDING.get(ticket)
+                if not entry or entry["expires_at"] <= time.monotonic():
+                    with PENDING_LOCK:
+                        PENDING.pop(ticket, None)
+                    return self.reply(410, {"error": "Approval session expired; connect again"})
+                status = approval_status(entry["user_id"])
+                if status == "pending":
+                    return self.reply(202, {"status": "pending"})
+                with PENDING_LOCK:
+                    entry = PENDING.pop(ticket, None)
+                if not entry:
+                    return self.reply(410, {"error": "Approval session already used"})
+                if status == "denied":
+                    return self.reply(403, {"error": "Access was denied by the owner"})
+                tokens = dict(entry["tokens"])
+                tokens["expires_in"] = max(1, int(tokens.get("expires_in", 3600)
+                    - (time.monotonic() - entry["created_at"])))
                 return self.reply(200, tokens)
             if self.command == "POST" and path == "/v1/oauth/refresh":
                 refresh_token = str(self.body()["refresh_token"])
@@ -158,8 +225,8 @@ class Handler(BaseHTTPRequestHandler):
                     "grant_type": "refresh_token", "client_id": CLIENT_ID,
                     "client_secret": CLIENT_SECRET, "refresh_token": refresh_token,
                 })
-                user_id, username = profile(tokens["access_token"])
-                if not allowed(user_id, username):
+                user_id, username, slug = profile(tokens["access_token"])
+                if not allowed(user_id, username, slug):
                     return self.reply(403, {"error": "Access has not been approved"})
                 return self.reply(200, tokens)
             if path == "/v1/admin/users" and self.command == "GET":
@@ -171,7 +238,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.admin()
                 user_id = int(path.removeprefix("/v1/admin/users/"))
                 status = self.body().get("status")
-                if user_id == ADMIN_ID or status not in ("approved", "denied", "pending"):
+                if status not in ("approved", "denied", "pending"):
                     raise ValueError("Invalid user or status")
                 with DB_LOCK, database() as db:
                     changed = db.execute("UPDATE users SET status=?, updated_at=? WHERE id=?", (status, int(time.time()), user_id)).rowcount

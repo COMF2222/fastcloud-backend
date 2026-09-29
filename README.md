@@ -3,15 +3,18 @@
 This is a separate backend for the Fastcloud desktop app. Playback, UI, caches,
 library operations and SoundCloud API calls remain on each user's computer. This
 service keeps the SoundCloud client secret private and stores only SoundCloud
-user IDs, names and approval states in SQLite. It does not store user tokens or
-audio. Pending users must sign in again after approval.
+user IDs, names and approval states in SQLite. It does not persist user tokens
+or audio. A pending OAuth token is held in memory for up to 15 minutes, then
+released once after the owner approves. The desktop app waits automatically.
 
 ## Setup
 
 1. Register your SoundCloud API app with redirect URI
    `http://127.0.0.1:41317/callback` (or set the exact URI in `.env`).
-2. Copy `.env.example` to `.env`, enter your app ID, secret and your numeric
-   SoundCloud user ID. Never commit `.env`.
+2. Copy `.env.example` to `.env`, enter your app ID and secret. The owner profile
+   URL is prefilled from the provided SoundCloud link; check that it is the
+   account that owns the API app. Tracking query parameters are unnecessary.
+   Never commit `.env`.
 3. Point a domain's DNS A/AAAA record at the server and set `FASTCLOUD_DOMAIN`
    in `.env`. Allow inbound ports 80 and 443. Run `docker compose up -d --build`.
    The included Caddy container obtains and renews HTTPS certificates and
@@ -21,8 +24,8 @@ audio. Pending users must sign in again after approval.
    development.
 
 The Docker volume `approvals` holds the SQLite allowlist and must be backed up.
-Keep `.env` and the volume when updating the container. Set the administrator ID
-to the account that owns the registered SoundCloud application. Administrators
+Keep `.env` and the volume when updating the container. The server compares the
+authenticated `/me` permalink with `SOUNDCLOUD_ADMIN_PROFILE_URL`. Administrators
 sign in to Fastcloud with that account and approve users in Account settings.
 
 Before public distribution, review SoundCloud's current API Terms of Use and
