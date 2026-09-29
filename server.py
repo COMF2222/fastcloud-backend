@@ -164,15 +164,15 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("Expected a JSON object")
         return value
 
-    def throttle(self):
+    def throttle(self, group, limit):
         now = time.monotonic()
-        address = self.client_address[0]
+        key = (self.client_address[0], group)
         with RATE_LOCK:
-            recent = [stamp for stamp in RATE.get(address, []) if now - stamp < 60]
-            if len(recent) >= 30:
+            recent = [stamp for stamp in RATE.get(key, []) if now - stamp < 60]
+            if len(recent) >= limit:
                 return False
             recent.append(now)
-            RATE[address] = recent
+            RATE[key] = recent
             if len(RATE) > 10000:
                 RATE.clear()
         return True
@@ -186,10 +186,11 @@ class Handler(BaseHTTPRequestHandler):
             raise PermissionError("Owner account required")
 
     def handle_request(self):
-        if not self.throttle():
+        path = urllib.parse.urlsplit(self.path).path
+        polling = path == "/v1/oauth/pending"
+        if not self.throttle("pending" if polling else "general", 300 if polling else 30):
             return self.reply(429, {"error": "Too many requests"})
         try:
-            path = urllib.parse.urlsplit(self.path).path
             if self.command == "GET" and path == "/health":
                 return self.reply(200, {"status": "ok"})
             if self.command == "GET" and path == "/v1/config":

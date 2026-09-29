@@ -62,7 +62,8 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual((status, result["status"]), (202, "pending"))
         self.assertNotIn("access_token", result)
         ticket = result["ticket"]
-        self.assertEqual(self.call("/v1/oauth/pending", {"ticket": ticket})[0], 202)
+        for _ in range(40):
+            self.assertEqual(self.call("/v1/oauth/pending", {"ticket": ticket})[0], 202)
         self.assertEqual(self.call("/v1/admin/users")[0], 403)
         status, result = self.call("/v1/admin/users", token="owner")
         self.assertEqual((status, result["users"][0]["status"]), (200, "pending"))
