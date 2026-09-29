@@ -15,11 +15,13 @@ released once after the owner approves. The desktop app waits automatically.
    URL is prefilled from the provided SoundCloud link; check that it is the
    account that owns the API app. Tracking query parameters are unnecessary.
    Never commit `.env`.
-3. Point a domain's DNS A/AAAA record at the server and set `FASTCLOUD_DOMAIN`
-   in `.env`. Allow inbound ports 80 and 443. Run `docker compose up -d --build`.
-   The included Caddy container obtains and renews HTTPS certificates and
-   forwards traffic to the broker; the broker has no public port.
-4. Check `https://api.example.com/health` and enter that HTTPS URL in Fastcloud's
+3. For a domain, point its DNS A/AAAA record at the server and set
+   `FASTCLOUD_DOMAIN` in `.env`; run `docker compose up -d --build`.
+   For a direct IPv4 address, set `FASTCLOUD_PUBLIC_IP` in `.env` and run
+   `docker compose -f compose.ip.yaml up -d --build`. Both modes require inbound
+   ports 80 and 443. The IP mode uses Certbot 5.8 to obtain and renew a public
+   short-lived Let's Encrypt IP certificate; the domain mode uses Caddy.
+4. Check `https://<domain-or-ip>/health` and enter that HTTPS URL in Fastcloud's
    Account settings. Local HTTP is allowed only for `localhost`/`127.0.0.1`
    development.
 

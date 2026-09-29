@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx ca-certificates \
+    && rm -f /etc/nginx/sites-enabled/default \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir certbot==5.8.0
+
+COPY ip-proxy/bootstrap.conf /etc/nginx/bootstrap.conf
+COPY ip-proxy/https.conf /etc/nginx/https.conf
+COPY ip-proxy/start.sh /usr/local/bin/start-ip-proxy
+
+RUN chmod 755 /usr/local/bin/start-ip-proxy
+
+EXPOSE 80 443
+ENTRYPOINT ["/usr/local/bin/start-ip-proxy"]

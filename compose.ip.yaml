@@ -1,0 +1,30 @@
+services:
+  fastcloud:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - approvals:/data
+    expose:
+      - "8080"
+
+  ip-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.ip-proxy
+    restart: unless-stopped
+    depends_on:
+      - fastcloud
+    environment:
+      FASTCLOUD_PUBLIC_IP: ${FASTCLOUD_PUBLIC_IP:?Set FASTCLOUD_PUBLIC_IP in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ip_certificates:/etc/letsencrypt
+      - ip_acme_webroot:/var/www/acme
+
+volumes:
+  approvals:
+  ip_certificates:
+  ip_acme_webroot:
