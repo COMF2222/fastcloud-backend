@@ -1,0 +1,3 @@
+{$FASTCLOUD_DOMAIN} {
+    reverse_proxy fastcloud:8080
+}

@@ -1,0 +1,29 @@
+services:
+  fastcloud:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - approvals:/data
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - fastcloud
+    environment:
+      FASTCLOUD_DOMAIN: ${FASTCLOUD_DOMAIN:?Set FASTCLOUD_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  approvals:
+  caddy_data:
+  caddy_config:

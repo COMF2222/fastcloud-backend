@@ -1,0 +1,5 @@
+.env
+.git
+*.sqlite3*
+__pycache__/
+test_server.py
