@@ -1,4 +1,5 @@
 .env
+vpn/config.yaml
 .git
 *.sqlite3*
 __pycache__/

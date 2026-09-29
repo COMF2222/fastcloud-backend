@@ -1,0 +1,13 @@
+services:
+  fastcloud:
+    depends_on:
+      - mihomo
+    environment:
+      HTTPS_PROXY: http://mihomo:7890
+      NO_PROXY: localhost,127.0.0.1
+
+  mihomo:
+    image: metacubex/mihomo:latest
+    restart: unless-stopped
+    volumes:
+      - ./vpn/config.yaml:/root/.config/mihomo/config.yaml:ro
