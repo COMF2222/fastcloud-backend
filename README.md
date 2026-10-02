@@ -3,7 +3,7 @@
 This is a separate backend for the Fastcloud desktop app. Playback, UI, caches,
 library operations and SoundCloud API calls remain on each user's computer. This
 service keeps the SoundCloud client secret private and stores only SoundCloud
-user IDs, names and approval states in SQLite. It does not persist user tokens
+user IDs, names, approval states and the latest release version in SQLite. It does not persist user tokens
 or audio. A pending OAuth token is held in memory for up to 15 minutes, then
 released once after the owner approves. The desktop app waits automatically.
 
@@ -40,3 +40,31 @@ Revocation takes effect immediately for token refresh. An already issued
 SoundCloud access token remains usable until it expires (usually about one hour).
 The backend never acts as an audio proxy. SoundCloud's published play limit is
 15,000 stream requests per 24 hours per client ID; other limits may apply.
+
+## Release notifications
+
+`GET /v1/updates/events` is a public Server-Sent Events connection containing
+only the latest published version. It sends a heartbeat every 20 seconds and
+replays the stored version after reconnects or a backend restart. It contains
+no account information. The desktop's Rust client uses this connection without
+changing frontend CSP or exposing OAuth credentials.
+
+`POST /v1/updates/published` accepts `{"version":"0.2.1-a"}` with
+`Authorization: Bearer <notification-secret>`. Set a random
+`FASTCLOUD_RELEASE_NOTIFY_TOKEN` in the existing server `.env` and the same
+value in the desktop repository's GitHub Actions secret. The desktop release
+workflow sends this request only after all signed update assets are published.
+Duplicate delivery is safe; malformed and older versions are rejected.
+
+Deploy this backend before releasing a client with push support. For the
+existing IP + VPN installation, from `/root/fastcloud-backend` run:
+
+```sh
+git pull --ff-only
+docker compose -f compose.ip.yaml -f compose.vpn.yaml up -d --build
+```
+
+Keep `.env`, `vpn/config.yaml` and the approvals volume. When GitHub lacks the
+notification secret, existing releases still work through the 30-minute
+fallback. The IP proxy respects `X-Accel-Buffering: no` on these responses;
+[Caddy flushes event streams immediately](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#streaming).

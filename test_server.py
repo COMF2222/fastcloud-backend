@@ -24,6 +24,7 @@ class BrokerTest(unittest.TestCase):
             server.RATE.clear()
         self.temp = tempfile.TemporaryDirectory()
         server.DB_PATH = Path(self.temp.name) / "approvals.sqlite3"
+        server.RELEASES = server.ReleaseNotifications()
         self.http = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)
         self.thread.start()
@@ -35,10 +36,12 @@ class BrokerTest(unittest.TestCase):
         self.thread.join()
         self.temp.cleanup()
 
-    def call(self, path, body=None, token=None):
+    def call(self, path, body=None, token=None, release_token=None):
         headers = {}
         if token:
             headers["Authorization"] = "OAuth " + token
+        if release_token:
+            headers["Authorization"] = "Bearer " + release_token
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(self.base + path, data=data, headers=headers)
         try:
@@ -120,6 +123,72 @@ class BrokerTest(unittest.TestCase):
         self.assertEqual(server.profile_slug("https://soundcloud.com/owner?utm_source=id_335378"), "owner")
         with self.assertRaises(ValueError):
             server.profile_slug("https://example.com/owner")
+
+    @patch.object(server, "RELEASE_NOTIFY_TOKEN", "test-release-notify")
+    def test_release_notification_requires_the_separate_secret(self):
+        payload = {"version": "0.2.1"}
+        self.assertEqual(self.call("/v1/updates/published", payload)[0], 403)
+        self.assertEqual(self.call("/v1/updates/published", payload, release_token="wrong")[0], 403)
+        self.assertIsNone(server.RELEASES.snapshot())
+
+    @patch.object(server, "RELEASE_NOTIFY_TOKEN", "")
+    def test_unconfigured_notifications_do_not_affect_health(self):
+        self.assertEqual(self.call("/v1/updates/published", {"version": "0.2.1"})[0], 503)
+        self.assertEqual(self.call("/health")[0], 200)
+
+    @patch.object(server, "RELEASE_NOTIFY_TOKEN", "test-release-notify")
+    def test_release_is_pushed_to_all_open_connections_without_polling(self):
+        with urllib.request.urlopen(self.base + "/v1/updates/events", timeout=2) as first, \
+                urllib.request.urlopen(self.base + "/v1/updates/events", timeout=2) as second:
+            for response in (first, second):
+                self.assertEqual(response.headers["Content-Type"], "text/event-stream")
+                self.assertEqual(response.headers["X-Accel-Buffering"], "no")
+                self.assertEqual(response.readline(), b": connected\n")
+                self.assertEqual(response.readline(), b"\n")
+            self.assertEqual(self.call("/v1/updates/published", {"version": "0.2.1"},
+                                       release_token="test-release-notify")[0], 200)
+            for response in (first, second):
+                self.assertEqual(response.readline(), b"event: release\n")
+                self.assertEqual(json.loads(response.readline().removeprefix(b"data: ")), {"version": "0.2.1"})
+
+    @patch.object(server, "RELEASE_NOTIFY_TOKEN", "test-release-notify")
+    def test_reconnect_and_server_restart_replay_the_persisted_release(self):
+        self.call("/v1/updates/published", {"version": "0.2.1"}, release_token="test-release-notify")
+        server.RELEASES = server.ReleaseNotifications()
+        with urllib.request.urlopen(self.base + "/v1/updates/events", timeout=2) as response:
+            self.assertEqual(response.readline(), b"event: release\n")
+            self.assertEqual(json.loads(response.readline().removeprefix(b"data: ")), {"version": "0.2.1"})
+
+    @patch.object(server, "RELEASE_NOTIFY_TOKEN", "test-release-notify")
+    def test_notifications_cannot_roll_back_the_release_or_change_approvals(self):
+        with server.database() as db:
+            db.execute("INSERT INTO users VALUES (42, 'Listener', 'approved', 123)")
+            db.execute("INSERT INTO metadata VALUES ('admin_id', '1')")
+        for version in ("0.2.10", "0.2.10"):
+            self.assertEqual(self.call("/v1/updates/published", {"version": version},
+                                       release_token="test-release-notify")[0], 200)
+        for version in ("0.2.9", "0.2.10\nevent: release", "", None, "0.2.11-beta", "01.2.3"):
+            self.assertEqual(self.call("/v1/updates/published", {"version": version},
+                                       release_token="test-release-notify")[0], 400)
+        self.assertEqual(server.RELEASES.snapshot(), "0.2.10")
+        with server.database() as db:
+            self.assertEqual(db.execute("SELECT * FROM users").fetchall(), [(42, 'Listener', 'approved', 123)])
+        self.assertEqual(server.admin_id(), 1)
+
+    @patch.object(server, "UPDATE_HEARTBEAT_SECONDS", 0.02)
+    def test_idle_connections_receive_a_heartbeat(self):
+        with urllib.request.urlopen(self.base + "/v1/updates/events", timeout=2) as response:
+            self.assertEqual(response.readline(), b": connected\n")
+            response.readline()
+            self.assertEqual(response.readline(), b": heartbeat\n")
+
+    @patch.object(server, "RELEASE_NOTIFY_TOKEN", "test-release-notify")
+    def test_lettered_hotfixes_use_semver_priority(self):
+        for version in ("0.2.1-a", "0.2.1-b", "0.2.1"):
+            self.assertEqual(self.call("/v1/updates/published", {"version": version},
+                                       release_token="test-release-notify")[0], 200)
+        self.assertEqual(self.call("/v1/updates/published", {"version": "0.2.1-a"},
+                                   release_token="test-release-notify")[0], 400)
 
     @patch.object(server, "soundcloud")
     def test_owner_connects_and_keeps_access_after_profile_rename(self, soundcloud):

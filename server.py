@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -38,6 +39,9 @@ RATE = {}
 PENDING_LOCK = threading.Lock()
 PENDING = {}
 PENDING_SECONDS = 15 * 60
+RELEASE_NOTIFY_TOKEN = os.environ.get("FASTCLOUD_RELEASE_NOTIFY_TOKEN", "")
+UPDATE_STREAMS = threading.BoundedSemaphore(256)
+UPDATE_HEARTBEAT_SECONDS = 20
 
 
 class UpstreamError(Exception):
@@ -160,6 +164,52 @@ def pending_ticket(user_id, tokens):
     return ticket
 
 
+def release_number(version):
+    match = re.fullmatch(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})(?:-([a-z]))?", version) if isinstance(version, str) else None
+    if not match:
+        raise ValueError("Expected a release version such as 0.2.1 or 0.2.1-a")
+    return (*map(int, match.groups()[:3]), 0 if match[4] else 1, match[4] or "")
+
+
+class ReleaseNotifications:
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.loaded = False
+        self.version = None
+
+    def snapshot(self):
+        # The same condition covers snapshots and publication, so a release
+        # cannot fall between the first event and the subscriber's wait.
+        with self.condition:
+            if not self.loaded:
+                with DB_LOCK, database() as db:
+                    row = db.execute("SELECT value FROM metadata WHERE key='release_version'").fetchone()
+                self.version = row[0] if row else None
+                self.loaded = True
+            return self.version
+
+    def publish(self, version):
+        number = release_number(version)
+        with self.condition:
+            previous = self.snapshot()
+            if previous and number < release_number(previous):
+                raise ValueError("Cannot announce an older release")
+            if version != previous:
+                with DB_LOCK, database() as db:
+                    db.execute("INSERT INTO metadata (key, value) VALUES ('release_version', ?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (version,))
+                self.version = version
+                self.condition.notify_all()
+
+    def wait(self, previous):
+        with self.condition:
+            self.condition.wait_for(lambda: self.version != previous, UPDATE_HEARTBEAT_SECONDS)
+            return self.version
+
+
+RELEASES = ReleaseNotifications()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format_string, *args):
         # Paths, request bodies and SoundCloud credentials are never logged.
@@ -205,14 +255,58 @@ class Handler(BaseHTTPRequestHandler):
         if not is_admin(user_id, slug):
             raise PermissionError("Owner account required")
 
+    def update_events(self):
+        if not UPDATE_STREAMS.acquire(blocking=False):
+            return self.reply(503, {"error": "Update notification capacity reached"})
+        try:
+            notifications = RELEASES
+            version = notifications.snapshot()
+            self.connection.settimeout(30)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            def send(current):
+                message = (f"event: release\ndata: {json.dumps({'version': current})}\n\n"
+                           if current else ": connected\n\n")
+                self.wfile.write(message.encode())
+                self.wfile.flush()
+            send(version)
+            while True:
+                current = notifications.wait(version)
+                if current != version:
+                    send(current)
+                    version = current
+                else:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+        except OSError:
+            pass
+        finally:
+            UPDATE_STREAMS.release()
+
     def handle_request(self):
         path = urllib.parse.urlsplit(self.path).path
         polling = path == "/v1/oauth/pending"
-        if not self.throttle("pending" if polling else "general", 300 if polling else 30):
+        updates = path == "/v1/updates/events"
+        if not self.throttle("pending" if polling else "updates" if updates else "general", 300 if polling or updates else 30):
             return self.reply(429, {"error": "Too many requests"})
         try:
             if self.command == "GET" and path == "/health":
                 return self.reply(200, {"status": "ok"})
+            if self.command == "GET" and path == "/v1/updates/events":
+                return self.update_events()
+            if self.command == "POST" and path == "/v1/updates/published":
+                if not RELEASE_NOTIFY_TOKEN:
+                    return self.reply(503, {"error": "Release notifications are not configured"})
+                authorization = self.headers.get("Authorization", "")
+                if not secrets.compare_digest(authorization.encode(), ("Bearer " + RELEASE_NOTIFY_TOKEN).encode()):
+                    raise PermissionError("Release notification token required")
+                version = self.body().get("version")
+                RELEASES.publish(version)
+                return self.reply(200, {"version": version})
             if self.command == "GET" and path == "/v1/config":
                 return self.reply(200, {"client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI})
             if self.command == "POST" and path == "/v1/oauth/exchange":
