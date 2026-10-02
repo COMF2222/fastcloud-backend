@@ -56,6 +56,33 @@ class BrokerTest(unittest.TestCase):
             with error:
                 return error.code, json.load(error)
 
+    @patch.object(server, "TRUST_PROXY", True)
+    def test_proxy_throttling_separates_clients_and_ignores_invalid_or_public_peer_headers(self):
+        handler = object.__new__(server.Handler)
+        handler.client_address = ("172.18.0.2", 8080)
+        for index in range(50):
+            handler.headers = {"X-Real-IP": f"203.0.113.{index+1}"}
+            self.assertTrue(handler.throttle("test", 1))
+        handler.headers = {"X-Real-IP": "203.0.113.1"}
+        self.assertFalse(handler.throttle("test", 1))
+        handler.headers = {"X-Real-IP": "malformed"}
+        self.assertTrue(handler.throttle("test", 1))
+        handler.headers = {"X-Real-IP": "malformed-again"}
+        self.assertFalse(handler.throttle("test", 1))
+        handler.client_address = ("8.8.8.8", 8080)
+        handler.headers = {"X-Real-IP": "203.0.113.51"}
+        self.assertTrue(handler.throttle("test", 1))
+        handler.headers = {"X-Real-IP": "203.0.113.52"}
+        self.assertFalse(handler.throttle("test", 1))
+
+    @patch.object(server, "TRUST_PROXY", False)
+    def test_direct_server_does_not_trust_client_supplied_forwarding_headers(self):
+        handler = object.__new__(server.Handler)
+        handler.client_address = ("127.0.0.1", 8080)
+        for address, allowed in (("203.0.113.1", True), ("203.0.113.2", False)):
+            handler.headers = {"X-Real-IP": address}
+            self.assertEqual(handler.throttle("test", 1), allowed)
+
     @patch.object(server, "soundcloud")
     def test_open_access_registers_users_and_manual_mode_only_gates_newcomers(self, soundcloud):
         with server.database() as db:

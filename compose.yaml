@@ -3,6 +3,8 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    environment:
+      FASTCLOUD_TRUST_PROXY: "true"
     volumes:
       - approvals:/data
       - media_cache:/media

@@ -1,6 +1,7 @@
 """Small OAuth approval broker for the Fastcloud desktop application."""
 
 import json
+import ipaddress
 import os
 import re
 import secrets
@@ -34,6 +35,7 @@ ADMIN_SLUG = profile_slug(os.environ["SOUNDCLOUD_ADMIN_PROFILE_URL"])
 DB_PATH = Path(os.environ.get("FASTCLOUD_DB_PATH", "/data/approvals.sqlite3"))
 HOST = os.environ.get("FASTCLOUD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("FASTCLOUD_PORT", "8080"))
+TRUST_PROXY = os.environ.get("FASTCLOUD_TRUST_PROXY", "false").lower() == "true"
 DB_LOCK = threading.Lock()
 RATE_LOCK = threading.Lock()
 RATE = {}
@@ -288,7 +290,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def throttle(self, group, limit):
         now = time.monotonic()
-        key = (self.client_address[0], group)
+        address = self.client_address[0]
+        if TRUST_PROXY:
+            try:
+                peer = ipaddress.ip_address(address)
+                forwarded = ipaddress.ip_address(self.headers.get("X-Real-IP", ""))
+                # Only the explicitly configured internal proxy is trusted.
+                # Both supplied proxy configurations overwrite this header.
+                if peer.is_private or peer.is_loopback:
+                    address = str(forwarded)
+            except ValueError:
+                pass
+        key = (address, group)
         with RATE_LOCK:
             recent = [stamp for stamp in RATE.get(key, []) if now - stamp < 60]
             if len(recent) >= limit:
@@ -405,7 +418,7 @@ class Handler(BaseHTTPRequestHandler):
         updates = path == "/v1/updates/events"
         media = path.startswith("/v1/media/")
         if not self.throttle("media" if media else "pending" if polling else "updates" if updates else "general",
-                             6000 if media else 300 if polling or updates else 30):
+                             6000 if media else 300 if polling or updates else 120):
             return self.reply(429, {"error": "Too many requests"})
         try:
             if media:

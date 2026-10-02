@@ -47,6 +47,12 @@ new users; existing approved users retain access. Turning it off also approves
 pending users, including open pending OAuth tickets. Denied users stay denied.
 The mode survives restarts and is controlled in Settings → Account by the owner.
 
+The supplied Compose setups enable `FASTCLOUD_TRUST_PROXY=true` because the
+backend is only exposed inside Docker. Nginx/Caddy overwrite `X-Real-IP`, so
+per-IP limits distinguish listeners instead of counting the proxy as one user.
+Unproxied installations ignore forwarded headers by default. General requests
+allow 120/minute per IP to accommodate shared networks; media uses its own budget.
+
 Blocking a user immediately denies future cached audio requests and token
 refresh. Already downloaded/decoded audio cannot be remotely recalled. A
 previously issued SoundCloud access token can still access SoundCloud directly

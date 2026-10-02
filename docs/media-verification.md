@@ -7,7 +7,7 @@ were retained. Previous container images were kept for rollback.
 
 ## Automated checks
 
-- 26 Python broker/cache tests on Windows and the server's Python 3.12 runtime.
+- 28 Python broker/cache tests on Windows and the server's Python 3.12 runtime.
 - Desktop Cargo check and TypeScript check passed.
 - All desktop Rust library tests: 207 passed, 2 intentionally ignored.
 - The optional `shared_media_sample_decodes` smoke test was also run explicitly
@@ -37,6 +37,8 @@ this exact CDN host is allowed and never receives the OAuth header.
 - Unauthenticated users/settings/statistics requests returned 403; an
   unauthenticated media resolve returned 401. Non-admin access and revocation
   were additionally covered by the isolated broker tests.
+- Proxy rate-limit tests separate 50 client IPs and reject invalid headers,
+  forwarding headers on a direct server and spoofed headers from public peers.
 - At idle after the load test, backend RSS was about 25 MiB and proxy RSS 9 MiB.
 
 This verifies cached playback on this VPS during a short test. It does not
