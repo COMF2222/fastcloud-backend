@@ -6,6 +6,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import closing
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +19,9 @@ import server
 
 class BrokerTest(unittest.TestCase):
     def setUp(self):
+        owner = patch.object(server, "ADMIN_SLUG", "owner")
+        owner.start()
+        self.addCleanup(owner.stop)
         with server.PENDING_LOCK:
             server.PENDING.clear()
         with server.RATE_LOCK:
@@ -25,6 +29,7 @@ class BrokerTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         server.DB_PATH = Path(self.temp.name) / "approvals.sqlite3"
         server.RELEASES = server.ReleaseNotifications()
+        server.set_access_settings(True)
         self.http = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)
         self.thread.start()
@@ -50,6 +55,46 @@ class BrokerTest(unittest.TestCase):
         except urllib.error.HTTPError as error:
             with error:
                 return error.code, json.load(error)
+
+    @patch.object(server, "soundcloud")
+    def test_open_access_registers_users_and_manual_mode_only_gates_newcomers(self, soundcloud):
+        with server.database() as db:
+            db.execute("DELETE FROM metadata WHERE key='approval_required'")
+        self.assertFalse(server.access_settings()["approval_required"])
+        def reply(url, *, token=None, form=None):
+            if url.endswith("/me"):
+                user_id = 1 if token == "owner" else int(token or 42)
+                return {"id": user_id, "username": "User", "permalink": "owner" if user_id == 1 else "listener"}
+            return {"access_token": str(form.get("code", "42")), "refresh_token": "next", "expires_in": 3600}
+        soundcloud.side_effect = reply
+        payload = {"code": "42", "verifier": "v" * 43}
+        self.assertEqual(self.call("/v1/oauth/exchange", payload)[0], 200)
+        self.assertEqual(self.call("/v1/admin/settings", token="42")[0], 403)
+        self.assertEqual(self.call("/v1/admin/settings", {"approval_required": True}, "42")[0], 403)
+        self.assertEqual(self.call("/v1/admin/users", token="42")[0], 403)
+        self.assertEqual(self.call("/v1/admin/media", token="42")[0], 403)
+        self.assertEqual(self.call("/v1/admin/settings", {"approval_required": True}, "owner")[0], 200)
+        self.assertEqual(self.call("/v1/oauth/exchange", payload)[0], 200)
+        status, pending = self.call("/v1/oauth/exchange", {**payload, "code": "43"})
+        self.assertEqual(status, 202)
+        self.assertEqual(self.call("/v1/admin/users/42", {"status": "denied"}, "owner")[0], 200)
+        self.assertEqual(self.call("/v1/admin/settings", {"approval_required": False}, "owner")[0], 200)
+        self.assertEqual(self.call("/v1/oauth/pending", {"ticket": pending["ticket"]})[0], 200)
+        self.assertEqual(self.call("/v1/oauth/exchange", payload)[0], 403)
+        self.assertFalse(server.access_settings()["approval_required"])
+        self.assertEqual(self.call("/v1/admin/settings", {"approval_required": "false"}, "owner")[0], 400)
+        self.assertEqual(self.call("/v1/admin/users/1", {"status": "denied"}, "owner")[0], 400)
+
+    def test_schema_upgrade_preserves_existing_approvals(self):
+        server.DB_PATH = Path(self.temp.name) / "legacy.sqlite3"
+        import sqlite3
+        with closing(sqlite3.connect(server.DB_PATH)) as db, db:
+            db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL,status TEXT NOT NULL,updated_at INTEGER NOT NULL)")
+            db.execute("INSERT INTO users VALUES (42,'Listener','denied',123)")
+        with server.database() as db:
+            self.assertEqual(db.execute("SELECT id,status,updated_at FROM users").fetchone(), (42, "denied", 123))
+            self.assertEqual(len(db.execute("PRAGMA table_info(users)").fetchall()), 4)
+        self.assertFalse(server.allowed(42, "Listener", "listener"))
 
     @patch.object(server.urllib.request, "urlopen")
     def test_upstream_error_identifies_stage_and_redacts_credentials(self, urlopen):
@@ -87,7 +132,7 @@ class BrokerTest(unittest.TestCase):
             self.assertEqual(self.call("/v1/oauth/pending", {"ticket": ticket})[0], 202)
         self.assertEqual(self.call("/v1/admin/users")[0], 403)
         status, result = self.call("/v1/admin/users", token="owner")
-        self.assertEqual((status, result["users"][0]["status"]), (200, "pending"))
+        self.assertEqual((status, next(user for user in result["users"] if user["id"] == 42)["status"]), (200, "pending"))
         self.assertEqual(server.admin_id(), 1)
         owner_slug[0] = "new-owner-name"
         self.assertEqual(self.call("/v1/admin/users", token="owner")[0], 200)
@@ -162,7 +207,7 @@ class BrokerTest(unittest.TestCase):
     @patch.object(server, "RELEASE_NOTIFY_TOKEN", "test-release-notify")
     def test_notifications_cannot_roll_back_the_release_or_change_approvals(self):
         with server.database() as db:
-            db.execute("INSERT INTO users VALUES (42, 'Listener', 'approved', 123)")
+            db.execute("INSERT INTO users (id,username,status,updated_at) VALUES (42, 'Listener', 'approved', 123)")
             db.execute("INSERT INTO metadata VALUES ('admin_id', '1')")
         for version in ("0.2.10", "0.2.10"):
             self.assertEqual(self.call("/v1/updates/published", {"version": version},
@@ -172,7 +217,7 @@ class BrokerTest(unittest.TestCase):
                                        release_token="test-release-notify")[0], 400)
         self.assertEqual(server.RELEASES.snapshot(), "0.2.10")
         with server.database() as db:
-            self.assertEqual(db.execute("SELECT * FROM users").fetchall(), [(42, 'Listener', 'approved', 123)])
+            self.assertEqual(db.execute("SELECT id,username,status,updated_at FROM users").fetchall(), [(42, 'Listener', 'approved', 123)])
         self.assertEqual(server.admin_id(), 1)
 
     @patch.object(server, "UPDATE_HEARTBEAT_SECONDS", 0.02)

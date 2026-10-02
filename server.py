@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from media import MediaCache, MediaError
 from contextlib import contextmanager
 
 
@@ -42,6 +43,32 @@ PENDING_SECONDS = 15 * 60
 RELEASE_NOTIFY_TOKEN = os.environ.get("FASTCLOUD_RELEASE_NOTIFY_TOKEN", "")
 UPDATE_STREAMS = threading.BoundedSemaphore(256)
 UPDATE_HEARTBEAT_SECONDS = 20
+MEDIA = None
+MEDIA_LOCK = threading.Lock()
+
+
+def media_permitted(user_id):
+    return user_id == admin_id() or approval_status(user_id) == "approved"
+
+
+def media_profile(token):
+    identity = profile(token)
+    allowed(*identity)
+    return identity
+
+
+def media_cache():
+    global MEDIA
+    if os.environ.get("FASTCLOUD_MEDIA_ENABLED", "true").lower() != "true":
+        raise MediaError(503, "Server audio cache is disabled")
+    with MEDIA_LOCK:
+        if MEDIA is None:
+            MEDIA = MediaCache(os.environ.get("FASTCLOUD_MEDIA_CACHE_ROOT", "/media"),
+                media_profile, media_permitted, soundcloud,
+                max_bytes=int(os.environ.get("FASTCLOUD_MEDIA_CACHE_BYTES", str(5 * 1024**3))),
+                min_free=int(os.environ.get("FASTCLOUD_MEDIA_MIN_FREE_BYTES", str(3 * 1024**3))),
+                downloads=int(os.environ.get("FASTCLOUD_MEDIA_DOWNLOADS", "4")))
+        return MEDIA
 
 
 class UpstreamError(Exception):
@@ -59,6 +86,7 @@ def database():
         "updated_at INTEGER NOT NULL)"
     )
     connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS user_activity (user_id INTEGER PRIMARY KEY,last_seen INTEGER NOT NULL)")
     connection.commit()
     try:
         yield connection
@@ -88,6 +116,8 @@ def soundcloud(url, *, token=None, form=None):
             response = json.loads(error.read(2048))
         except (ValueError, UnicodeDecodeError):
             response = {}
+        finally:
+            error.close()
         if not isinstance(response, dict):
             response = {}
         detail = response.get("error_description") or response.get("error") or response.get("message")
@@ -130,18 +160,40 @@ def is_admin(user_id, slug):
 
 
 def allowed(user_id, username, slug):
-    if is_admin(user_id, slug):
-        return True
+    owner = is_admin(user_id, slug)
     with DB_LOCK, database() as db:
         row = db.execute("SELECT status FROM users WHERE id=?", (user_id,)).fetchone()
+        setting = db.execute("SELECT value FROM metadata WHERE key='approval_required'").fetchone()
+        manual = bool(setting and setting[0] == "true")
+        now = int(time.time())
         if row is None:
-            db.execute("INSERT INTO users VALUES (?,?,?,?)", (user_id, username, "pending", int(time.time())))
-            db.commit()
-            return False
-        if row[0] != "denied":
-            db.execute("UPDATE users SET username=? WHERE id=?", (username, user_id))
-            db.commit()
-        return row[0] == "approved"
+            status = "approved" if owner or not manual else "pending"
+            db.execute("INSERT INTO users (id,username,status,updated_at) VALUES (?,?,?,?)",
+                       (user_id, username, status, now))
+        else:
+            status = "approved" if owner or (row[0] == "pending" and not manual) else row[0]
+            db.execute("UPDATE users SET username=?,status=? WHERE id=?", (username, status, user_id))
+        db.execute("INSERT INTO user_activity VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET last_seen=excluded.last_seen",
+                   (user_id, now))
+        return status == "approved"
+
+
+def access_settings():
+    with DB_LOCK, database() as db:
+        row = db.execute("SELECT value FROM metadata WHERE key='approval_required'").fetchone()
+    return {"approval_required": bool(row and row[0] == "true")}
+
+
+def set_access_settings(required):
+    if not isinstance(required, bool):
+        raise ValueError("approval_required must be a boolean")
+    with DB_LOCK, database() as db:
+        db.execute("INSERT INTO metadata (key,value) VALUES ('approval_required',?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(required),))
+        if not required:
+            db.execute("UPDATE users SET status='approved',updated_at=? WHERE status='pending'",
+                       (int(time.time()),))
+    return {"approval_required": required}
 
 
 def approval_status(user_id):
@@ -287,13 +339,77 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             UPDATE_STREAMS.release()
 
+    def media_request(self, path):
+        cache = media_cache()
+        with cache.admission():
+            if path == "/v1/media/resolve" and self.command == "POST":
+                authorization = self.headers.get("Authorization", "")
+                if not authorization.startswith("OAuth "):
+                    raise MediaError(401, "SoundCloud sign-in required")
+                return self.reply(200, cache.resolve(self.body().get("urn"), authorization[6:]))
+            match = re.fullmatch(r"/v1/media/([A-Za-z0-9_-]{43})/(index\.m3u8|[a-f0-9]{64}\.seg)", path)
+            if not match or self.command != "GET":
+                raise MediaError(404, "Unknown media endpoint")
+            ticket, name = match.groups()
+            if name == "index.m3u8":
+                data = cache.playlist(ticket)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            stream, size = cache.segment(ticket, name[:-4])
+            served = 0
+            with stream:
+                start, end = 0, size - 1
+                requested = self.headers.get("Range")
+                if requested:
+                    match = re.fullmatch(r"bytes=(\d*)-(\d*)", requested)
+                    if not match or not any(match.groups()):
+                        raise MediaError(416, "Unsupported audio byte range")
+                    left, right = match.groups()
+                    start = int(left) if left else max(0, size - int(right))
+                    end = min(size - 1, int(right)) if left and right else size - 1
+                    if start > end or start >= size:
+                        raise MediaError(416, "Audio byte range is outside the segment")
+                self.send_response(206 if requested else 200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Length", str(end - start + 1))
+                if requested:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                self.connection.settimeout(15)
+                stream.seek(start)
+                remaining = end - start + 1
+                try:
+                    while remaining:
+                        chunk = stream.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        served += len(chunk)
+                        remaining -= len(chunk)
+                except OSError:
+                    pass
+                finally:
+                    cache.record_served(served)
+
     def handle_request(self):
         path = urllib.parse.urlsplit(self.path).path
         polling = path == "/v1/oauth/pending"
         updates = path == "/v1/updates/events"
-        if not self.throttle("pending" if polling else "updates" if updates else "general", 300 if polling or updates else 30):
+        media = path.startswith("/v1/media/")
+        if not self.throttle("media" if media else "pending" if polling else "updates" if updates else "general",
+                             6000 if media else 300 if polling or updates else 30):
             return self.reply(429, {"error": "Too many requests"})
         try:
+            if media:
+                return self.media_request(path)
             if self.command == "GET" and path == "/health":
                 return self.reply(200, {"status": "ok"})
             if self.command == "GET" and path == "/v1/updates/events":
@@ -362,11 +478,20 @@ class Handler(BaseHTTPRequestHandler):
                 if not allowed(user_id, username, slug):
                     return self.reply(403, {"error": "Access has not been approved"})
                 return self.reply(200, tokens)
+            if path == "/v1/admin/settings" and self.command in ("GET", "POST"):
+                self.admin()
+                if self.command == "POST":
+                    return self.reply(200, set_access_settings(self.body().get("approval_required")))
+                return self.reply(200, access_settings())
+            if path == "/v1/admin/media" and self.command == "GET":
+                self.admin()
+                return self.reply(200, media_cache().stats())
             if path == "/v1/admin/users" and self.command == "GET":
                 self.admin()
                 with DB_LOCK, database() as db:
-                    rows = db.execute("SELECT id, username, status, updated_at FROM users ORDER BY updated_at DESC").fetchall()
-                return self.reply(200, {"users": [dict(zip(("id", "username", "status", "updated_at"), row)) for row in rows]})
+                    rows = db.execute("SELECT u.id,u.username,u.status,u.updated_at,COALESCE(a.last_seen,0) AS last_seen "
+                                      "FROM users u LEFT JOIN user_activity a ON a.user_id=u.id ORDER BY last_seen DESC,u.updated_at DESC").fetchall()
+                return self.reply(200, {"users": [dict(zip(("id", "username", "status", "updated_at", "last_seen"), row)) for row in rows]})
             if path.startswith("/v1/admin/users/") and self.command == "POST":
                 self.admin()
                 user_id = int(path.removeprefix("/v1/admin/users/"))
@@ -382,6 +507,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(404, {"error": "Unknown endpoint"})
         except PermissionError as error:
             return self.reply(403, {"error": str(error)})
+        except MediaError as error:
+            return self.reply(error.status, {"error": str(error)})
         except UpstreamError as error:
             return self.reply(502, {"error": str(error)})
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
@@ -393,7 +520,17 @@ class Handler(BaseHTTPRequestHandler):
     do_POST = handle_request
 
 
+class BrokerServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(15)
+        return connection, address
+
+
 if __name__ == "__main__":
     with database():
         pass
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    BrokerServer((HOST, PORT), Handler).serve_forever()

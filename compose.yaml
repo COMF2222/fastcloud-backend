@@ -5,6 +5,7 @@ services:
     env_file: .env
     volumes:
       - approvals:/data
+      - media_cache:/media
     expose:
       - "8080"
 
@@ -25,5 +26,6 @@ services:
 
 volumes:
   approvals:
+  media_cache:
   caddy_data:
   caddy_config:
