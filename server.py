@@ -14,6 +14,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from media import MediaCache, MediaError
+from relay import Relay
 from contextlib import contextmanager
 
 
@@ -47,6 +48,8 @@ UPDATE_STREAMS = threading.BoundedSemaphore(256)
 UPDATE_HEARTBEAT_SECONDS = 20
 MEDIA = None
 MEDIA_LOCK = threading.Lock()
+RELAY = Relay(lambda user_id: media_permitted(user_id),
+              record_served=lambda size: media_cache().record_served(size))
 
 
 def media_permitted(user_id):
@@ -279,6 +282,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def relay_reply(self, status, body, headers):
+        self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def body(self):
         size = int(self.headers.get("Content-Length", "0"))
         if size <= 0 or size > 8192:
@@ -417,10 +430,13 @@ class Handler(BaseHTTPRequestHandler):
         polling = path == "/v1/oauth/pending"
         updates = path == "/v1/updates/events"
         media = path.startswith("/v1/media/")
-        if not self.throttle("media" if media else "pending" if polling else "updates" if updates else "general",
-                             6000 if media else 300 if polling or updates else 120):
+        relay = path.startswith("/v1/soundcloud/")
+        if not self.throttle("relay" if relay else "media" if media else "pending" if polling else "updates" if updates else "general",
+                             2400 if relay else 6000 if media else 300 if polling or updates else 120):
             return self.reply(429, {"error": "Too many requests"})
         try:
+            if relay:
+                return RELAY.handle(self, path)
             if media:
                 return self.media_request(path)
             if self.command == "GET" and path == "/health":
@@ -531,6 +547,8 @@ class Handler(BaseHTTPRequestHandler):
 
     do_GET = handle_request
     do_POST = handle_request
+    do_PUT = handle_request
+    do_DELETE = handle_request
 
 
 class BrokerServer(ThreadingHTTPServer):

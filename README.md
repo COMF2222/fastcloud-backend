@@ -2,8 +2,9 @@
 
 This backend keeps the SoundCloud client secret private, manages access and
 release notifications, and caches public playable HLS audio segments. The UI,
-decoding, equalizer, library operations and account tokens remain on each user's
-computer. SQLite stores user IDs/names/statuses, last sign-in and access mode.
+decoding, equalizer and account tokens remain on each user's computer. SoundCloud
+API requests and artwork are relayed through the server. SQLite stores user
+IDs/names/statuses, last sign-in and access mode.
 OAuth tokens are only held in memory; audio and signed upstream URLs have their
 own bounded cache volume. Server storage/redistribution requires appropriate
 permission from SoundCloud and the relevant rights holders.
@@ -142,3 +143,25 @@ Keep `.env`, `vpn/config.yaml` and the approvals volume. When GitHub lacks the
 notification secret, existing releases still work through the 30-minute
 fallback. The IP proxy respects `X-Accel-Buffering: no` on these responses;
 [Caddy flushes event streams immediately](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#streaming).
+# SoundCloud relay
+
+The desktop client uses `/v1/soundcloud/api/...` for the official SoundCloud
+API, including profiles, paginated libraries, search, comments and mutations.
+The broker forwards each user's own OAuth token; private JSON is never cached
+or shared. Token identities are cached in memory for 60 seconds, with the current
+approval status checked on every request. No OAuth credentials enter URLs or logs.
+
+Artwork is fetched through authenticated `POST /v1/soundcloud/artwork` (HTTPS
+SoundCloud image hosts only, 8 MiB per image). Audio which is not eligible for
+the shared disk cache uses expiring in-memory asset capabilities. HLS media,
+initialization and key URLs are rewritten to the broker, including previews;
+OAuth is stripped on CDN redirects. Byte ranges remain available for seeking.
+
+The relay admits at most 24 upstream requests at once and 2400 requests per
+minute per client address. JSON responses are limited to 10 MiB, audio segments
+to 64 MiB; multipart track uploads stream without buffering, capped at 4 GiB.
+Configure the supplied Nginx route when deploying (request size and disabled
+access logs). Existing OAuth, admin and shared-cache routes remain compatible
+with older clients. Deploy the backend before publishing clients that use it.
+The official SoundCloud browser sign-in page remains external; this relay does
+not proxy account passwords or bypass SoundCloud track availability.

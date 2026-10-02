@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY server.py media.py /app/
+COPY server.py media.py relay.py /app/
 ENV PYTHONUNBUFFERED=1 FASTCLOUD_HOST=0.0.0.0
 RUN useradd --system --uid 10001 fastcloud && mkdir -p /data /media && chown fastcloud /data /media
 USER fastcloud
