@@ -106,13 +106,16 @@ def parse_playlist(text, base, urn, bitrate):
 
 class MediaCache:
     def __init__(self, root, profile, permitted, api_json, *, max_bytes=5 * 1024**3,
-                 min_free=3 * 1024**3, downloads=4, max_segment=8 * 1024**2):
+                 min_free=3 * 1024**3, downloads=4, max_segment=8 * 1024**2,
+                 activity=None, record_stream=None):
         self.root = Path(root)
         self.objects = self.root / "objects"
         self.objects.mkdir(parents=True, exist_ok=True)
         self.profile = profile
         self.permitted = permitted
         self.api_json = api_json
+        self.activity = activity or (lambda user_id: None)
+        self.record_stream = record_stream or (lambda user_id, url: None)
         self.max_bytes, self.min_free, self.max_segment = max_bytes, min_free, max_segment
         self.downloads = threading.BoundedSemaphore(downloads)
         self.resolves = threading.BoundedSemaphore(4)
@@ -178,6 +181,7 @@ class MediaCache:
             user_id = entry[1]
         if not self.permitted(user_id):
             raise MediaError(403, "Access to Fastcloud was disabled by the owner")
+        self.activity(user_id)
         return user_id
 
     def fetch(self, url, token=None):
@@ -221,11 +225,14 @@ class MediaCache:
                         or not complete and time.time() - manifest["created"] > 600):
                     with self.state_lock:
                         self.counts["stream_requests"] += 1
-                    streams = self.api_json("https://api.soundcloud.com" + path + "/streams", token=token)
+                    stream_api = "https://api.soundcloud.com" + path + "/streams"
+                    self.record_stream(user_id, stream_api)
+                    streams = self.api_json(stream_api, token=token)
                     source = streams.get("hls_aac_160_url") or streams.get("hls_mp3_128_url")
                     if not source:
                         raise MediaError(422, "No full HLS stream available")
                     bitrate = 160 if streams.get("hls_aac_160_url") else 128
+                    self.record_stream(user_id, source)
                     with self.fetch(source, token) as response:
                         data = response.read(256 * 1024 + 1)
                         if len(data) > 256 * 1024:
@@ -257,6 +264,7 @@ class MediaCache:
             raise MediaError(401, "Playback session expired; start the track again")
         if not self.permitted(entry["user"]):
             raise MediaError(403, "Access to Fastcloud was disabled by the owner")
+        self.activity(entry["user"])
         return entry
 
     def playlist(self, value):
@@ -329,6 +337,7 @@ class MediaCache:
                         self.prune(active * self.max_segment)
                     size = 0
                     started = time.monotonic()
+                    self.record_stream(entry["user"], asset["url"])
                     with self.fetch(asset["url"], entry["token"]) as upstream, partial.open("wb") as output:
                         expected = upstream.headers.get("Content-Length")
                         if expected and int(expected) > self.max_segment:

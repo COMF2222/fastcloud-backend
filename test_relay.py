@@ -76,7 +76,8 @@ class RelayTest(unittest.TestCase):
         with server.RATE_LOCK:
             server.RATE.clear()
         self.upstream = FakeUpstream()
-        self.relay = Relay(server.media_permitted, opener=self.upstream)
+        self.relay = Relay(server.media_permitted, opener=self.upstream,
+                           activity=server.touch_activity, record_stream=server.record_stream_request)
         relay = patch.object(server, "RELAY", self.relay)
         relay.start()
         self.addCleanup(relay.stop)
@@ -112,6 +113,42 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.upstream.requests[-1][0], "https://api.soundcloud.com" + path)
         self.assertIn(b'next_href', body)
+
+    def test_session_presence_and_role_require_authorized_identity(self):
+        self.assertEqual(self.call('/v1/session', token=None)[0], 401)
+        self.assertEqual(self.call('/v1/session', token='invalid')[0], 401)
+        status, body, _ = self.call('/v1/session')
+        self.assertEqual((status, json.loads(body)), (200, {'user_id': 42, 'admin': False}))
+        self.assertEqual(json.loads(self.call('/v1/session', token='owner')[1])['admin'], True)
+        users = {u['id']: u for u in server.admin_users()}
+        self.assertTrue(users[42]['online'])
+        self.assertEqual(users[42]['stream_requests_today'], 0)
+        with patch.object(server, 'profile', return_value=(42, 'Listener', 'listener')):
+            self.assertEqual(self.call('/v1/admin/users')[0], 403)
+        with server.database() as db:
+            db.execute("UPDATE users SET status='denied' WHERE id=42")
+        before = len(self.upstream.requests)
+        self.assertEqual(self.call('/v1/session')[0], 403)
+        self.assertEqual(len(self.upstream.requests), before)
+        self.assertFalse(next(u for u in server.admin_users() if u['id'] == 42)['online'])
+
+    def test_audio_api_usage_is_attributed_before_relay_and_excludes_cdn(self):
+        self.assertEqual(self.call(PREFIX + '/api/tracks?q=sad')[0], 200)
+        status, body, _ = self.call(PREFIX + '/api/tracks/42/streams')
+        self.assertEqual(status, 200)
+        stream = json.loads(body)['hls_aac_160_url']
+        status, playlist, _ = self.call(stream, token=None)
+        self.assertEqual(status, 200)
+        cdn = next(line for line in playlist.decode().splitlines() if line.startswith(PREFIX))
+        self.assertEqual(self.call(cdn, token=None)[0], 200)
+        self.assertEqual(self.call(PREFIX + '/api/tracks/43/streams', token='other')[0], 200)
+        users = {u['id']: u for u in server.admin_users()}
+        self.assertEqual(users[42]['stream_requests_today'], 2)  # resolver + API HLS; no CDN
+        self.assertEqual(users[43]['stream_requests_today'], 1)
+        with server.database() as db:
+            db.execute("UPDATE users SET status='denied' WHERE id=42")
+        self.assertEqual(self.call(stream, token=None)[0], 403)
+        self.assertEqual(next(u for u in server.admin_users() if u['id'] == 42)['stream_requests_today'], 2)
 
     def test_tokens_are_isolated_and_owner_denial_is_immediate(self):
         for token in ("user", "other", "owner"):

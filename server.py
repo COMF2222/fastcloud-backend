@@ -16,6 +16,7 @@ from pathlib import Path
 from media import MediaCache, MediaError
 from relay import Relay
 from contextlib import contextmanager
+from usage import audio_api_request
 
 
 CLIENT_ID = os.environ["SOUNDCLOUD_CLIENT_ID"]
@@ -48,8 +49,13 @@ UPDATE_STREAMS = threading.BoundedSemaphore(256)
 UPDATE_HEARTBEAT_SECONDS = 20
 MEDIA = None
 MEDIA_LOCK = threading.Lock()
+ACTIVITY_LOCK = threading.Lock()
+ACTIVITY = {}
+ONLINE_SECONDS = 120
 RELAY = Relay(lambda user_id: media_permitted(user_id),
-              record_served=lambda size: media_cache().record_served(size))
+              record_served=lambda size: media_cache().record_served(size),
+              activity=lambda user_id: touch_activity(user_id),
+              record_stream=lambda user_id, url: record_stream_request(user_id, url))
 
 
 def media_permitted(user_id):
@@ -72,7 +78,8 @@ def media_cache():
                 media_profile, media_permitted, soundcloud,
                 max_bytes=int(os.environ.get("FASTCLOUD_MEDIA_CACHE_BYTES", str(5 * 1024**3))),
                 min_free=int(os.environ.get("FASTCLOUD_MEDIA_MIN_FREE_BYTES", str(3 * 1024**3))),
-                downloads=int(os.environ.get("FASTCLOUD_MEDIA_DOWNLOADS", "4")))
+                downloads=int(os.environ.get("FASTCLOUD_MEDIA_DOWNLOADS", "4")),
+                activity=touch_activity, record_stream=record_stream_request)
         return MEDIA
 
 
@@ -92,6 +99,7 @@ def database():
     )
     connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS user_activity (user_id INTEGER PRIMARY KEY,last_seen INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS daily_stream_usage (day TEXT NOT NULL,user_id INTEGER NOT NULL,requests INTEGER NOT NULL,PRIMARY KEY(day,user_id))")
     connection.commit()
     try:
         yield connection
@@ -205,6 +213,51 @@ def approval_status(user_id):
     with DB_LOCK, database() as db:
         row = db.execute("SELECT status FROM users WHERE id=?", (user_id,)).fetchone()
     return row[0] if row else "pending"
+
+
+def touch_activity(user_id):
+    # Audio segments arrive frequently. Persist presence at most every 20s
+    # without putting another SQLite write on every segment's hot path.
+    key = (str(DB_PATH), user_id)
+    with ACTIVITY_LOCK:
+        clock = time.monotonic()
+        if clock - ACTIVITY.get(key, float("-inf")) < 20:
+            return
+        with DB_LOCK, database() as db:
+            db.execute("INSERT INTO user_activity VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET last_seen=excluded.last_seen",
+                       (user_id, int(time.time())))
+        if len(ACTIVITY) >= 2048:
+            ACTIVITY.pop(next(iter(ACTIVITY)))
+        ACTIVITY[key] = clock
+
+
+def record_stream_request(user_id, url):
+    if not audio_api_request(url):
+        return
+    now = time.time()
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    oldest = time.strftime("%Y-%m-%d", time.gmtime(now - 7 * 86400))
+    with DB_LOCK, database() as db:
+        db.execute("INSERT INTO daily_stream_usage VALUES (?,?,1) ON CONFLICT(day,user_id) DO UPDATE SET requests=requests+1",
+                   (day, user_id))
+        db.execute("DELETE FROM daily_stream_usage WHERE day<?", (oldest,))
+
+
+def admin_users():
+    now = int(time.time())
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    with DB_LOCK, database() as db:
+        rows = db.execute("SELECT u.id,u.username,u.status,u.updated_at,COALESCE(a.last_seen,0),COALESCE(d.requests,0) "
+                          "FROM users u LEFT JOIN user_activity a ON a.user_id=u.id "
+                          "LEFT JOIN daily_stream_usage d ON d.user_id=u.id AND d.day=? "
+                          "ORDER BY COALESCE(a.last_seen,0) DESC,u.updated_at DESC", (day,)).fetchall()
+    users = []
+    for row in rows:
+        user = dict(zip(("id", "username", "status", "updated_at", "last_seen", "stream_requests_today"), row))
+        user.update(online=user["status"] == "approved" and now - ONLINE_SECONDS <= user["last_seen"] <= now,
+                    usage_day=day)
+        users.append(user)
+    return users
 
 
 def pending_ticket(user_id, tokens):
@@ -454,6 +507,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, {"version": version})
             if self.command == "GET" and path == "/v1/config":
                 return self.reply(200, {"client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI})
+            if self.command == "GET" and path == "/v1/session":
+                user_id, _ = RELAY.identity(self.headers.get("Authorization", ""))
+                touch_activity(user_id)
+                return self.reply(200, {"user_id": user_id, "admin": user_id == admin_id()})
             if self.command == "POST" and path == "/v1/oauth/exchange":
                 body = self.body()
                 code, verifier = str(body["code"]), str(body["verifier"])
@@ -517,10 +574,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, media_cache().stats())
             if path == "/v1/admin/users" and self.command == "GET":
                 self.admin()
-                with DB_LOCK, database() as db:
-                    rows = db.execute("SELECT u.id,u.username,u.status,u.updated_at,COALESCE(a.last_seen,0) AS last_seen "
-                                      "FROM users u LEFT JOIN user_activity a ON a.user_id=u.id ORDER BY last_seen DESC,u.updated_at DESC").fetchall()
-                return self.reply(200, {"users": [dict(zip(("id", "username", "status", "updated_at", "last_seen"), row)) for row in rows]})
+                return self.reply(200, {"users": admin_users()})
             if path.startswith("/v1/admin/users/") and self.command == "POST":
                 self.admin()
                 user_id = int(path.removeprefix("/v1/admin/users/"))

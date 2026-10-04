@@ -84,6 +84,28 @@ class MediaTest(unittest.TestCase):
         self.assertEqual(len(self.cache.keys.entries), 0)
         self.assertEqual(self.cache.stats()["cache_hits"], 49)
 
+    def test_shared_cache_charges_only_the_user_triggering_an_audio_api_call(self):
+        from usage import audio_api_request
+        usage, active = [], []
+        self.allowed = {42, 43}
+        self.cache = MediaCache(self.temp.name, lambda token: (int(token), 'Listener', 'listener'),
+                                lambda user: user in self.allowed, self.api, min_free=0,
+                                activity=active.append,
+                                record_stream=lambda user, url: usage.append(user) if audio_api_request(url) else None)
+        self.cache.fetch = self.fetch
+        first = self.ticket(self.cache.resolve('soundcloud:tracks:7', '42'))
+        for asset in self.cache.ticket(first)['manifest']['assets']:
+            self.download(first, asset['key'])
+        second = self.ticket(self.cache.resolve('soundcloud:tracks:7', '43'))
+        for asset in self.cache.ticket(second)['manifest']['assets']:
+            self.download(second, asset['key'])
+        self.assertEqual(usage, [42])
+        self.assertIn(43, active)
+        self.allowed.remove(43)
+        with self.assertRaises(MediaError):
+            self.cache.resolve('soundcloud:tracks:8', '43')
+        self.assertEqual(usage, [42])
+
     def test_distinct_cold_segments_never_exceed_four_downloads(self):
         result = self.cache.resolve("soundcloud:tracks:7", "token")
         ticket = self.ticket(result)
@@ -222,6 +244,11 @@ class MediaHTTPTest(unittest.TestCase):
                     self.assertEqual(values, [b"0123456789"] * 50)
                     with urllib.request.urlopen(urllib.request.Request(base + segment, headers={"Range": "bytes=2-5"})) as response:
                         self.assertEqual((response.status, response.read()), (206, b"2345"))
+                    # The body can reach the HTTP client before the handler's
+                    # finally block persists delivered bytes.
+                    deadline = time.monotonic() + 2
+                    while cache.stats()["month_served_bytes"] < 504 and time.monotonic() < deadline:
+                        time.sleep(0.01)
                     self.assertEqual(cache.stats()["month_served_bytes"], 504)
                     with self.assertRaises(urllib.error.HTTPError) as error:
                         urllib.request.urlopen(urllib.request.Request(base + segment, headers={"Range": "bytes=99-"}))

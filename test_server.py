@@ -123,6 +123,46 @@ class BrokerTest(unittest.TestCase):
             self.assertEqual(len(db.execute("PRAGMA table_info(users)").fetchall()), 4)
         self.assertFalse(server.allowed(42, "Listener", "listener"))
 
+    def test_usage_is_atomic_persistent_and_rolls_over_at_utc_midnight(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import datetime, timezone
+        now = datetime(2026, 10, 4, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+        with server.database() as db:
+            db.executemany('INSERT INTO users VALUES (?,?,?,?)', [(42, 'First', 'approved', 1), (43, 'Second', 'approved', 1)])
+            db.execute("INSERT INTO daily_stream_usage VALUES ('2026-09-01',42,7)")
+        with patch.object(server.time, 'time', return_value=now):
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                list(pool.map(lambda _: server.record_stream_request(42, 'https://api.soundcloud.com/tracks/7/streams'), range(100)))
+            server.record_stream_request(43, 'https://api.soundcloud.com/tracks/7/stream/hls')
+            for url in ('https://cf-media.sndcdn.com/7.aac', 'https://api.soundcloud.com/me', 'https://api.soundcloud.com/tracks/7'):
+                server.record_stream_request(42, url)
+            users = {u['id']: u for u in server.admin_users()}
+            self.assertEqual(users[42]['stream_requests_today'], 100)
+            self.assertEqual(users[43]['stream_requests_today'], 1)
+            self.assertEqual(users[42]['usage_day'], '2026-10-04')
+        with patch.object(server.time, 'time', return_value=now + 2):
+            self.assertTrue(all(u['stream_requests_today'] == 0 for u in server.admin_users()))
+            server.record_stream_request(43, 'https://api.soundcloud.com/tracks/7/preview')
+            self.assertEqual({u['id']: u['stream_requests_today'] for u in server.admin_users()}, {42: 0, 43: 1})
+        with server.database() as db:
+            self.assertEqual(db.execute("SELECT requests FROM daily_stream_usage WHERE day='2026-10-04' AND user_id=42").fetchone(), (100,))
+            self.assertIsNone(db.execute("SELECT 1 FROM daily_stream_usage WHERE day='2026-09-01'").fetchone())
+
+    def test_presence_expires_and_throttling_does_not_erase_last_active(self):
+        with server.database() as db:
+            db.execute("INSERT INTO users VALUES (42,'Listener','approved',1)")
+        with patch.object(server.time, 'time', return_value=1000), patch.object(server.time, 'monotonic', return_value=100):
+            server.touch_activity(42)
+            self.assertTrue(server.admin_users()[0]['online'])
+        with patch.object(server.time, 'time', return_value=1010), patch.object(server.time, 'monotonic', return_value=110):
+            server.touch_activity(42)
+            self.assertEqual(server.admin_users()[0]['last_seen'], 1000)
+        with patch.object(server.time, 'time', return_value=1121):
+            self.assertFalse(server.admin_users()[0]['online'])
+        with patch.object(server.time, 'time', return_value=1130), patch.object(server.time, 'monotonic', return_value=230):
+            server.touch_activity(42)
+            self.assertTrue(server.admin_users()[0]['online'])
+
     @patch.object(server.urllib.request, "urlopen")
     def test_upstream_error_identifies_stage_and_redacts_credentials(self, urlopen):
         body = json.dumps({"error": f"invalid_grant {server.CLIENT_SECRET} abc"}).encode()

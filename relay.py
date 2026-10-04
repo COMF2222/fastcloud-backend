@@ -53,7 +53,7 @@ class LimitedBody:
 
 
 class Relay:
-    def __init__(self, permitted, *, opener=None, record_served=None):
+    def __init__(self, permitted, *, opener=None, record_served=None, activity=None, record_stream=None):
         self.permitted = permitted
         self.opener = opener or urllib.request.build_opener(SafeRedirect())
         self.slots = threading.BoundedSemaphore(24)
@@ -62,6 +62,8 @@ class Relay:
         self.assets = {}
         self.asset_keys = {}
         self.record_served = record_served or (lambda size: None)
+        self.activity = activity or (lambda user_id: None)
+        self.record_stream = record_stream or (lambda user_id, url: None)
 
     @contextmanager
     def admission(self):
@@ -72,12 +74,14 @@ class Relay:
         finally:
             self.slots.release()
 
-    def open(self, url, *, token=None, method="GET", body=None, headers=None):
+    def open(self, url, *, token=None, method="GET", body=None, headers=None, user_id=None):
         checked_upstream(url)
         headers = dict(headers or {})
         if token and urllib.parse.urlsplit(url).hostname == "api.soundcloud.com":
             headers["Authorization"] = "OAuth " + token
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        if user_id is not None and method == "GET":
+            self.record_stream(user_id, url)
         try:
             return self.opener.open(request, timeout=20)
         except urllib.error.HTTPError as response:
@@ -119,6 +123,7 @@ class Relay:
         # Revocation takes effect even when a token's identity is cached.
         if not self.permitted(user_id):
             raise MediaError(403, "Access to Fastcloud was disabled by the owner")
+        self.activity(user_id)
         return user_id, token
 
     def capability(self, url, user_id, token, expires=None):
@@ -174,7 +179,8 @@ class Relay:
             if not re.fullmatch(r"bytes=\d*-\d*", requested) or requested == "bytes=-":
                 raise MediaError(416, "Unsupported byte range")
             headers["Range"] = requested
-        with self.open(url, token=token, headers=headers) as response:
+        self.activity(user_id)
+        with self.open(url, token=token, headers=headers, user_id=user_id) as response:
             content_type = response.headers.get("Content-Type", "application/octet-stream")
             playlist = "mpegurl" in content_type.lower() or urllib.parse.urlsplit(response.url).path.endswith(".m3u8")
             if response.status == 200 and playlist:
@@ -245,7 +251,7 @@ class Relay:
                     raise MediaError(400, "Multipart uploads are only supported for tracks")
                 headers.update({"Content-Type": content_type, "Content-Length": str(size)})
                 body = LimitedBody(handler.rfile, size)
-            with self.open(upstream, token=token, method=handler.command, body=body, headers=headers) as response:
+            with self.open(upstream, token=token, method=handler.command, body=body, headers=headers, user_id=user_id) as response:
                 if response.status == 200 and re.fullmatch(r"/tracks/[^/]+/preview", urllib.parse.urlsplit(upstream).path):
                     location = self.capability(response.url, user_id, token)
                     return handler.relay_reply(307, b"", {"Location": location})
