@@ -18,6 +18,19 @@ import server
 
 
 class BrokerTest(unittest.TestCase):
+    def test_personal_endpoint_uses_the_signed_in_identity_and_rejects_credentials(self):
+        with patch.object(server.RELAY,"identity",return_value=(1,"fixture")) as identity:
+            status, _ = self.call('/v1/me/personal', {"preferences":{"theme":"Dark"}}, token="fixture-one")
+            self.assertEqual(status,200)
+            identity.assert_called_with("OAuth fixture-one")
+            status, value = self.call('/v1/me/personal', token="fixture-one")
+            self.assertEqual(value['preferences']['theme'],'Dark')
+            status, _ = self.call('/v1/me/personal', {"preferences":{"client_id":"SECRET"}}, token="fixture-one")
+            self.assertEqual(status,400)
+        with patch.object(server.RELAY,"identity",return_value=(2,"second")):
+            status, value = self.call('/v1/me/personal', token="fixture-two")
+            self.assertEqual(status,200)
+            self.assertEqual(value['preferences'],{})
     def setUp(self):
         owner = patch.object(server, "ADMIN_SLUG", "owner")
         owner.start()

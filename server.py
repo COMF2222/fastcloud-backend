@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import sqlite3
+import personal
 import threading
 import time
 import urllib.error
@@ -100,6 +101,7 @@ def database():
     connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS user_activity (user_id INTEGER PRIMARY KEY,last_seen INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS daily_stream_usage (day TEXT NOT NULL,user_id INTEGER NOT NULL,requests INTEGER NOT NULL,PRIMARY KEY(day,user_id))")
+    personal.initialize(connection)
     connection.commit()
     try:
         yield connection
@@ -345,9 +347,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def body(self):
+    def body(self, limit=8192):
         size = int(self.headers.get("Content-Length", "0"))
-        if size <= 0 or size > 8192:
+        if size <= 0 or size > limit:
             raise ValueError("Invalid request size")
         value = json.loads(self.rfile.read(size))
         if not isinstance(value, dict):
@@ -511,6 +513,12 @@ class Handler(BaseHTTPRequestHandler):
                 user_id, _ = RELAY.identity(self.headers.get("Authorization", ""))
                 touch_activity(user_id)
                 return self.reply(200, {"user_id": user_id, "admin": user_id == admin_id()})
+            if path == "/v1/me/personal" and self.command in ("GET", "POST"):
+                user_id, _ = RELAY.identity(self.headers.get("Authorization", ""))
+                body = self.body(personal.MAX_BODY) if self.command == "POST" else None
+                with DB_LOCK, database() as db:
+                    data = personal.write(db, user_id, body) if body is not None else personal.read(db, user_id)
+                return self.reply(200, data)
             if self.command == "POST" and path == "/v1/oauth/exchange":
                 body = self.body()
                 code, verifier = str(body["code"]), str(body["verifier"])

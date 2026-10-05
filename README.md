@@ -165,3 +165,23 @@ access logs). Existing OAuth, admin and shared-cache routes remain compatible
 with older clients. Deploy the backend before publishing clients that use it.
 The official SoundCloud browser sign-in page remains external; this relay does
 not proxy account passwords or bypass SoundCloud track availability.
+
+## Portable personal data
+
+Authenticated `GET` / `POST /v1/me/personal` store per-account portable settings,
+custom appearance presets, quick-access pins, playlist folders, smart-playlist
+rules, new-like dates and personal listening counters in the existing SQLite
+volume. The route derives identity from the OAuth token and checks access through
+the same relay authorization flow; clients cannot select another user's ID.
+
+POST patches individual keys, preserving unrelated fields. Null folder/rule
+values delete that entity. Fields such as credentials, local wallpaper/font paths
+and downloaded audio are rejected. Limits are 2 MiB per body, 100 folders,
+50 smart rules and 100 listening records per upload.
+
+Statistics use cumulative counters keyed by user/device/UTC day/track; retries
+take the maximum rather than adding again. Different devices add independently.
+The schema initializes automatically with the existing database; no environment
+variable or new database service is needed. Retain and back up the persistent
+approvals volume. Deploy this backend before releasing clients using account
+sync. Existing clients and routes remain compatible.
