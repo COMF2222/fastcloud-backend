@@ -5,8 +5,14 @@ import ipaddress
 import os
 import re
 import secrets
+import signal
 import sqlite3
 import personal
+import operations
+import backup
+import hashlib
+from concurrency import Flights
+from upstream import open_read
 import threading
 import time
 import urllib.error
@@ -50,13 +56,29 @@ UPDATE_STREAMS = threading.BoundedSemaphore(256)
 UPDATE_HEARTBEAT_SECONDS = 20
 MEDIA = None
 MEDIA_LOCK = threading.Lock()
+OPERATIONS = None
+OPERATIONS_LOCK = threading.Lock()
+REFRESHES = Flights(limit=64, cache_bytes=1024 * 1024)
+PROFILES = Flights(limit=128, cache_bytes=1024 * 1024)
 ACTIVITY_LOCK = threading.Lock()
 ACTIVITY = {}
 ONLINE_SECONDS = 120
 RELAY = Relay(lambda user_id: media_permitted(user_id),
               record_served=lambda size: media_cache().record_served(size),
               activity=lambda user_id: touch_activity(user_id),
-              record_stream=lambda user_id, url: record_stream_request(user_id, url))
+              record_stream=lambda user_id, url: record_stream_request(user_id, url),
+              upstream_event=lambda **value: operation_service().upstream(**value),
+              upstream_bytes=lambda count: operation_service().add_bytes("upstream", count))
+
+
+def operation_service():
+    global OPERATIONS
+    with OPERATIONS_LOCK:
+        if OPERATIONS is None or OPERATIONS.path != DB_PATH:
+            OPERATIONS = operations.Operations(DB_PATH,
+                media_root=os.environ.get("FASTCLOUD_MEDIA_CACHE_ROOT", "/media"),
+                backup_root=os.environ.get("FASTCLOUD_BACKUP_ROOT", "/backups"))
+        return OPERATIONS
 
 
 def media_permitted(user_id):
@@ -80,12 +102,15 @@ def media_cache():
                 max_bytes=int(os.environ.get("FASTCLOUD_MEDIA_CACHE_BYTES", str(5 * 1024**3))),
                 min_free=int(os.environ.get("FASTCLOUD_MEDIA_MIN_FREE_BYTES", str(3 * 1024**3))),
                 downloads=int(os.environ.get("FASTCLOUD_MEDIA_DOWNLOADS", "4")),
-                activity=touch_activity, record_stream=record_stream_request)
+                activity=touch_activity, record_stream=record_stream_request,
+                upstream_event=lambda **value: operation_service().upstream(**value),
+                upstream_bytes=lambda count: operation_service().add_bytes("upstream", count))
         return MEDIA
 
 
 class UpstreamError(Exception):
     """A SoundCloud request failed; the client did not send a malformed request."""
+    expired = False
 
 
 @contextmanager
@@ -102,6 +127,7 @@ def database():
     connection.execute("CREATE TABLE IF NOT EXISTS user_activity (user_id INTEGER PRIMARY KEY,last_seen INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS daily_stream_usage (day TEXT NOT NULL,user_id INTEGER NOT NULL,requests INTEGER NOT NULL,PRIMARY KEY(day,user_id))")
     personal.initialize(connection)
+    operations.initialize(connection)
     connection.commit()
     try:
         yield connection
@@ -114,6 +140,14 @@ def database():
 
 
 def soundcloud(url, *, token=None, form=None):
+    if form and form.get("grant_type") == "refresh_token":
+        key = hashlib.sha256(str(form.get("refresh_token", "")).encode()).digest()
+        return REFRESHES.run(key, lambda: soundcloud_request(url, token=token, form=form),
+                             ttl=5, size=lambda value: len(json.dumps(value)))
+    return soundcloud_request(url, token=token, form=form)
+
+
+def soundcloud_request(url, *, token=None, form=None):
     headers = {"Accept": "application/json; charset=utf-8"}
     data = None
     if token:
@@ -123,7 +157,13 @@ def soundcloud(url, *, token=None, form=None):
         data = urllib.parse.urlencode(form).encode()
     request = urllib.request.Request(url, data=data, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        response = open_read(urllib.request, request, timeout=15,
+                             event=lambda **value: operation_service().upstream(**value),
+                             read_bytes=lambda count: operation_service().add_bytes("upstream", count))
+        if response.status >= 400:
+            # Keep the error body readable until invalid_grant is classified.
+            raise urllib.error.HTTPError(url, response.status, "Upstream error", response.headers, response)
+        with response:
             return json.load(response)
     except urllib.error.HTTPError as error:
         stage = "token exchange" if url.endswith("/oauth/token") else "profile lookup"
@@ -144,10 +184,17 @@ def soundcloud(url, *, token=None, form=None):
                 detail = detail.replace(sensitive, "[redacted]")
         detail = " ".join(detail.split())[:180]
         suffix = f": {detail}" if detail else ""
-        raise UpstreamError(f"SoundCloud {stage} returned HTTP {error.code}{suffix}") from None
+        failure = UpstreamError(f"SoundCloud {stage} returned HTTP {error.code}{suffix}")
+        failure.expired = (error.code == 401 or error.code == 400 and (form or {}).get("grant_type") == "refresh_token" and response.get("error") == "invalid_grant")
+        raise failure from None
 
 
 def profile(token):
+    key = hashlib.sha256(token.encode()).digest()
+    return PROFILES.run(key, lambda: profile_request(token), ttl=15, size=lambda value: 512)
+
+
+def profile_request(token):
     result = soundcloud("https://api.soundcloud.com/me", token=token)
     urn = str(result.get("urn", ""))
     user_id = result.get("id") or urn.rsplit(":", 1)[-1]
@@ -323,9 +370,26 @@ RELEASES = ReleaseNotifications()
 
 
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.operations = operation_service()
+        self.rfile = operations.CountedIO(self.rfile, self.operations, "inbound")
+        self.wfile = operations.CountedIO(self.wfile, self.operations, "outbound")
+        self.response_status = 500
+
+    def send_response(self, code, message=None):
+        self.response_status = code
+        return super().send_response(code, message)
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            self.operations.flush()
     def log_message(self, format_string, *args):
         # Paths, request bodies and SoundCloud credentials are never logged.
-        print("request from", self.client_address[0], flush=True)
+        if self.response_status >= 500:
+            print("HTTP request failed", self.response_status, flush=True)
 
     def reply(self, status, data):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -333,6 +397,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if self.command == "GET" and urllib.parse.urlsplit(self.path).path in ("/health", "/v1/status"):
+            # Only deliberately public, unauthenticated availability data.
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -481,6 +548,15 @@ class Handler(BaseHTTPRequestHandler):
                     cache.record_served(served)
 
     def handle_request(self):
+        started = time.monotonic()
+        try:
+            return self.dispatch_request()
+        finally:
+            if urllib.parse.urlsplit(self.path).path != "/v1/updates/events":
+                self.operations.request(status=self.response_status, ms=(time.monotonic() - started) * 1000,
+                                        category=operations.lane(self.path, self.command))
+
+    def dispatch_request(self):
         path = urllib.parse.urlsplit(self.path).path
         polling = path == "/v1/oauth/pending"
         updates = path == "/v1/updates/events"
@@ -496,6 +572,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.media_request(path)
             if self.command == "GET" and path == "/health":
                 return self.reply(200, {"status": "ok"})
+            if self.command == "GET" and path == "/v1/status":
+                return self.reply(200, self.operations.public_status())
+            if path == "/v1/admin/operations" and self.command in ("GET", "POST"):
+                self.admin()
+                if self.command == "POST": self.operations.update_settings(self.body())
+                return self.reply(200, self.operations.snapshot(MEDIA, RELAY))
+            if path == "/v1/admin/incidents" and self.command == "POST":
+                self.admin()
+                return self.reply(200, {"incidents": self.operations.incident(self.body())})
             if self.command == "GET" and path == "/v1/updates/events":
                 return self.update_events()
             if self.command == "POST" and path == "/v1/updates/published":
@@ -601,7 +686,7 @@ class Handler(BaseHTTPRequestHandler):
         except MediaError as error:
             return self.reply(error.status, {"error": str(error)})
         except UpstreamError as error:
-            return self.reply(502, {"error": str(error)})
+            return self.reply(401 if error.expired else 502, {"error": "SoundCloud session expired; sign in again" if error.expired else str(error)})
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
             return self.reply(400, {"error": str(error)})
         except Exception:
@@ -617,6 +702,23 @@ class BrokerServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128
 
+    def __init__(self, *args, **kwargs):
+        self.client_slots = threading.BoundedSemaphore(256)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self.client_slots.acquire(blocking=False):
+            try: request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\nRetry-After: 2\r\n\r\n")
+            finally: self.shutdown_request(request)
+            return
+        try: super().process_request(request, client_address)
+        except Exception:
+            self.client_slots.release(); raise
+
+    def process_request_thread(self, *args):
+        try: super().process_request_thread(*args)
+        finally: self.client_slots.release()
+
     def get_request(self):
         connection, address = super().get_request()
         connection.settimeout(15)
@@ -626,4 +728,12 @@ class BrokerServer(ThreadingHTTPServer):
 if __name__ == "__main__":
     with database():
         pass
-    BrokerServer((HOST, PORT), Handler).serve_forever()
+    stop = threading.Event()
+    service = operation_service()
+    threading.Thread(target=backup.worker, args=(service, stop), daemon=True).start()
+    http = BrokerServer((HOST, PORT), Handler)
+    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=http.shutdown, daemon=True).start())
+    try:
+        http.serve_forever()
+    finally:
+        stop.set(); service.flush(); http.server_close()

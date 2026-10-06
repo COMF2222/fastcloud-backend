@@ -3,11 +3,18 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=4))['status']=='ok'"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
     environment:
       FASTCLOUD_TRUST_PROXY: "true"
     volumes:
       - approvals:/data
       - media_cache:/media
+      - backups:/backups
     expose:
       - "8080"
 
@@ -29,5 +36,6 @@ services:
 volumes:
   approvals:
   media_cache:
+  backups:
   caddy_data:
   caddy_config:

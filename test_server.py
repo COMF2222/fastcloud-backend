@@ -18,6 +18,54 @@ import server
 
 
 class BrokerTest(unittest.TestCase):
+    @patch.object(server,'profile',return_value=(1,'Owner','owner'))
+    def test_browser_cors_is_only_enabled_for_public_availability(self, profile):
+        for path in ('/health','/v1/status','/v1/admin/operations'):
+            request=urllib.request.Request(self.base+path,headers={'Origin':'https://fastcloud.comf.workers.dev','Authorization':'OAuth owner'})
+            with urllib.request.urlopen(request) as response:
+                self.assertEqual(response.headers.get('Access-Control-Allow-Origin'),None if '/admin/' in path else '*')
+                self.assertIsNone(response.headers.get('Access-Control-Allow-Credentials'))
+
+    def test_refresh_failure_distinguishes_invalid_grant_and_never_replays_a_post(self):
+        for status,payload,expired in ((400,{'error':'invalid_grant'},True),(503,{'error':'temporary'},False)):
+            response=urllib.error.HTTPError('https://api.soundcloud.com/oauth/token',status,'fixture',{},io.BytesIO(json.dumps(payload).encode()))
+            with patch.object(server.urllib.request,'urlopen',side_effect=response) as request:
+                with self.assertRaises(server.UpstreamError) as result:
+                    server.soundcloud_request('https://api.soundcloud.com/oauth/token',form={'grant_type':'refresh_token','refresh_token':'fixture-token'})
+                self.assertEqual(result.exception.expired,expired);self.assertEqual(request.call_count,1)
+
+    def test_parallel_refreshes_share_one_success_and_failed_refresh_can_retry(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from concurrency import Flights
+        release=threading.Event();entered=threading.Event()
+        def exchange(*args,**kwargs):entered.set();release.wait(2);return {'access_token':'fixture-new-token'}
+        form={'grant_type':'refresh_token','refresh_token':'fixture-private'}
+        with patch.object(server,'REFRESHES',Flights()),patch.object(server,'soundcloud_request',side_effect=exchange) as request:
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                first=pool.submit(server.soundcloud,'https://api.soundcloud.com/oauth/token',form=form);entered.wait(1)
+                others=[pool.submit(server.soundcloud,'https://api.soundcloud.com/oauth/token',form=form) for _ in range(9)]
+                release.set()
+                self.assertEqual([first.result(),*[r.result() for r in others]],[{'access_token':'fixture-new-token'}]*10)
+            self.assertEqual(request.call_count,1)
+        with patch.object(server,'REFRESHES',Flights()),patch.object(server,'soundcloud_request',side_effect=[server.UpstreamError('temporary'),{'access_token':'fixture'}]) as request:
+            with self.assertRaises(server.UpstreamError):server.soundcloud('https://api.soundcloud.com/oauth/token',form=form)
+            self.assertEqual(server.soundcloud('https://api.soundcloud.com/oauth/token',form=form),{'access_token':'fixture'})
+
+    @patch.object(server, 'profile')
+    def test_operational_routes_require_owner_and_public_status_omits_private_data(self, profile):
+        profile.side_effect=lambda token:(1,'Owner','owner') if token=='owner' else (42,'Listener','listener')
+        for path in ('/v1/admin/operations',):
+            self.assertEqual(self.call(path,token='listener')[0],403)
+            self.assertEqual(self.call(path)[0],403)
+        status,data=self.call('/v1/admin/operations',{'monthly_limit_bytes':1000},token='owner')
+        self.assertEqual(status,200);self.assertEqual(data['settings']['monthly_limit_bytes'],1000)
+        self.assertEqual(self.call('/v1/admin/incidents',{'status':'maintenance','ru':'Проверка','en':'Check'},token='listener')[0],403)
+        self.assertEqual(self.call('/v1/admin/incidents',{'status':'maintenance','ru':'Проверка','en':'Check'},token='owner')[0],200)
+        status,data=self.call('/v1/status')
+        self.assertEqual(status,200);self.assertEqual(data['overall'],'maintenance')
+        for private in ('traffic','users','resources','settings','token','backup'):
+            self.assertNotIn(private,json.dumps(data))
+
     def test_personal_endpoint_uses_the_signed_in_identity_and_rejects_credentials(self):
         with patch.object(server.RELAY,"identity",return_value=(1,"fixture")) as identity:
             status, _ = self.call('/v1/me/personal', {"preferences":{"theme":"Dark"}}, token="fixture-one")

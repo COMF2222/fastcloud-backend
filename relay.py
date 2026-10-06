@@ -16,6 +16,9 @@ import urllib.request
 from contextlib import contextmanager
 
 from media import MediaError, SafeRedirect, checked_upstream
+from concurrency import Flights
+from operations import lane
+from upstream import open_read
 
 API = "https://api.soundcloud.com"
 PREFIX = "/v1/soundcloud"
@@ -53,10 +56,14 @@ class LimitedBody:
 
 
 class Relay:
-    def __init__(self, permitted, *, opener=None, record_served=None, activity=None, record_stream=None):
+    def __init__(self, permitted, *, opener=None, record_served=None, activity=None, record_stream=None,
+                 upstream_event=None, upstream_bytes=None):
         self.permitted = permitted
         self.opener = opener or urllib.request.build_opener(SafeRedirect())
         self.slots = threading.BoundedSemaphore(24)
+        self.lanes = {name: threading.BoundedSemaphore(capacity) for name, capacity in {"audio":16,"search":6,"metadata":8,"heavy":2}.items()}
+        self.identity_slots = threading.BoundedSemaphore(4)
+        self.flights = Flights()
         self.lock = threading.Lock()
         self.identities = {}
         self.assets = {}
@@ -64,15 +71,22 @@ class Relay:
         self.record_served = record_served or (lambda size: None)
         self.activity = activity or (lambda user_id: None)
         self.record_stream = record_stream or (lambda user_id, url: None)
+        self.upstream_event = upstream_event or (lambda **value: None)
+        self.upstream_bytes = upstream_bytes or (lambda count: None)
 
     @contextmanager
-    def admission(self):
+    def admission(self, category="metadata"):
+        category_slot = self.lanes[category]
+        if not category_slot.acquire(timeout=1):
+            raise MediaError(503, "This operation is busy; playback capacity is reserved")
         if not self.slots.acquire(timeout=2):
+            category_slot.release()
             raise MediaError(503, "SoundCloud relay is busy; retry shortly")
         try:
             yield
         finally:
             self.slots.release()
+            category_slot.release()
 
     def open(self, url, *, token=None, method="GET", body=None, headers=None, user_id=None):
         checked_upstream(url)
@@ -80,12 +94,10 @@ class Relay:
         if token and urllib.parse.urlsplit(url).hostname == "api.soundcloud.com":
             headers["Authorization"] = "OAuth " + token
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
-        if user_id is not None and method == "GET":
-            self.record_stream(user_id, url)
         try:
-            return self.opener.open(request, timeout=20)
-        except urllib.error.HTTPError as response:
-            return response
+            return open_read(self.opener, request, timeout=20,
+                before=lambda: self.record_stream(user_id, url) if user_id is not None and method == "GET" else None,
+                event=self.upstream_event, read_bytes=self.upstream_bytes)
         except (OSError, urllib.error.URLError):
             raise MediaError(502, "SoundCloud could not be reached through the server") from None
 
@@ -106,16 +118,23 @@ class Relay:
         if saved and saved[1] > time.monotonic():
             user_id = saved[0]
         else:
-            with self.open(API + "/me", token=token) as response:
-                if response.status == 401:
-                    raise MediaError(401, "SoundCloud session expired; sign in again")
-                if response.status != 200:
-                    raise MediaError(502, "SoundCloud profile validation failed")
+            def lookup():
+                if not self.identity_slots.acquire(timeout=2):
+                    raise MediaError(503, "Account validation is busy; retry shortly")
                 try:
-                    profile = json.loads(self.read(response, MAX_JSON))
-                    user_id = int(profile.get("id") or profile["urn"].rsplit(":", 1)[-1])
-                except (ValueError, KeyError, TypeError):
-                    raise MediaError(502, "SoundCloud profile response could not be read") from None
+                    with self.open(API + "/me", token=token) as response:
+                        if response.status == 401:
+                            raise MediaError(401, "SoundCloud session expired; sign in again")
+                        if response.status != 200:
+                            raise MediaError(502, "SoundCloud profile validation failed")
+                        try:
+                            profile = json.loads(self.read(response, MAX_JSON))
+                            return int(profile.get("id") or profile["urn"].rsplit(":", 1)[-1])
+                        except (ValueError, KeyError, TypeError):
+                            raise MediaError(502, "SoundCloud profile response could not be read") from None
+                finally:
+                    self.identity_slots.release()
+            user_id = self.flights.run(("identity", key), lookup)
             with self.lock:
                 if len(self.identities) >= 2048:
                     self.identities.clear()
@@ -219,7 +238,7 @@ class Relay:
                 self.record_served(sent)
 
     def handle(self, handler, path):
-        with self.admission():
+        with self.admission(lane(handler.path, handler.command)):
             match = re.fullmatch(PREFIX + r"/asset/([A-Za-z0-9_-]{43})", path)
             if match and handler.command == "GET":
                 return self.asset(handler, match[1])
@@ -229,9 +248,12 @@ class Relay:
                 checked_upstream(url)
                 if not re.fullmatch(r"i[1-4]\.sndcdn\.com", urllib.parse.urlsplit(url).hostname or ""):
                     raise MediaError(400, "Only SoundCloud artwork is allowed")
-                with self.open(url) as response:
-                    data = self.read(response, 8 * 1024 * 1024)
-                    return handler.relay_reply(response.status, data, {"Content-Type": response.headers.get("Content-Type", "application/octet-stream")})
+                def fetch_artwork():
+                    with self.open(url) as response:
+                        return response.status, self.read(response, 8 * 1024 * 1024), {"Content-Type": response.headers.get("Content-Type", "application/octet-stream")}
+                value = self.flights.run(("artwork",url), fetch_artwork, ttl=300,
+                    size=lambda value: len(value[1]) if value[0] == 200 and value[2]["Content-Type"].startswith("image/") else self.flights.cache_bytes + 1)
+                return handler.relay_reply(*value)
             if not path.startswith(PREFIX + "/api/") or handler.command not in {"GET", "POST", "PUT", "DELETE"}:
                 raise MediaError(404, "Unknown SoundCloud relay endpoint")
             upstream = api_url(handler.path.removeprefix(PREFIX + "/api"))
@@ -251,14 +273,22 @@ class Relay:
                     raise MediaError(400, "Multipart uploads are only supported for tracks")
                 headers.update({"Content-Type": content_type, "Content-Length": str(size)})
                 body = LimitedBody(handler.rfile, size)
-            with self.open(upstream, token=token, method=handler.command, body=body, headers=headers, user_id=user_id) as response:
-                if response.status == 200 and re.fullmatch(r"/tracks/[^/]+/preview", urllib.parse.urlsplit(upstream).path):
-                    location = self.capability(response.url, user_id, token)
-                    return handler.relay_reply(307, b"", {"Location": location})
-                data = self.read(response, MAX_JSON)
-                if 200 <= response.status < 300 and urllib.parse.urlsplit(upstream).path.endswith("/streams"):
+            def fetch_api():
+                with self.open(upstream, token=token, method=handler.command, body=body, headers=headers, user_id=user_id) as response:
+                    result_headers = {"Content-Type": response.headers.get("Content-Type", "application/json")}
+                    if response.headers.get("Retry-After"): result_headers["Retry-After"] = response.headers["Retry-After"]
+                    return response.status, self.read(response, MAX_JSON), result_headers, response.url
+            public_read = handler.command == "GET" and urllib.parse.urlsplit(upstream).path.split("/")[1] in {"tracks","users","playlists","resolve"}
+            if public_read:
+                # OAuth-scoped grouping preserves user-specific flags and private
+                # objects. No /me response or mutation is grouped or cached.
+                result = self.flights.run(("api",hashlib.sha256(token.encode()).digest(),upstream),fetch_api)
+            else:
+                result = fetch_api()
+            status, data, result_headers, final_url = result
+            if status == 200 and re.fullmatch(r"/tracks/[^/]+/preview", urllib.parse.urlsplit(upstream).path):
+                location = self.capability(final_url, user_id, token)
+                return handler.relay_reply(307, b"", {"Location": location})
+            if 200 <= status < 300 and urllib.parse.urlsplit(upstream).path.endswith("/streams"):
                     data = json.dumps(self.streams(json.loads(data), user_id, token)).encode()
-                result_headers = {"Content-Type": response.headers.get("Content-Type", "application/json")}
-                if response.headers.get("Retry-After"):
-                    result_headers["Retry-After"] = response.headers["Retry-After"]
-                return handler.relay_reply(response.status, data, result_headers)
+            return handler.relay_reply(status, data, result_headers)

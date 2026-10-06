@@ -64,6 +64,38 @@ class FakeUpstream:
 
 
 class RelayTest(unittest.TestCase):
+    def test_public_reads_group_within_an_account_and_artwork_cache_is_shared(self):
+        import time
+        self.relay.identity('OAuth user');self.relay.identity('OAuth other')
+        original=self.upstream.open
+        entered=threading.Event();release=threading.Event()
+        def delayed(request,timeout):
+            if 'q=fixture' in request.full_url:entered.set();release.wait(3)
+            return original(request,timeout)
+        with patch.object(self.upstream,'open',side_effect=delayed):
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                pending=[pool.submit(self.call,PREFIX+'/api/tracks?q=fixture') for _ in range(6)]
+                entered.wait(2);deadline=time.monotonic()+2
+                while self.relay.flights.snapshot()['grouped']<5 and time.monotonic()<deadline:time.sleep(.005)
+                release.set();results=[request.result() for request in pending]
+            self.assertTrue(all(result[0]==200 for result in results))
+            calls=[r for r in self.upstream.requests if '/tracks?' in r[0]]
+            self.assertEqual(len(calls),1)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results=list(pool.map(lambda token:self.call(PREFIX+'/api/tracks?q=separate',token=token),['user','other']))
+            self.assertEqual({json.loads(result[1])['authorization'] for result in results},{'OAuth user','OAuth other'})
+        for token in ('user','other'):
+            status,_,_=self.call(PREFIX+'/artwork','POST',json.dumps({'url':'https://i1.sndcdn.com/fixture.jpg'}).encode(),token=token)
+            self.assertEqual(status,200)
+        self.assertEqual(len([r for r in self.upstream.requests if 'fixture.jpg' in r[0]]),1)
+
+    def test_playback_lane_retains_capacity_when_other_lanes_are_full(self):
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for category,capacity in (('search',6),('metadata',8),('heavy',2)):
+                for _ in range(capacity):stack.enter_context(self.relay.admission(category))
+            for _ in range(8):stack.enter_context(self.relay.admission('audio'))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         db = patch.object(server, "DB_PATH", Path(self.temp.name) / "approvals.sqlite3")

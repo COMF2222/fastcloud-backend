@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from upstream import open_read
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -107,7 +108,7 @@ def parse_playlist(text, base, urn, bitrate):
 class MediaCache:
     def __init__(self, root, profile, permitted, api_json, *, max_bytes=5 * 1024**3,
                  min_free=3 * 1024**3, downloads=4, max_segment=8 * 1024**2,
-                 activity=None, record_stream=None):
+                 activity=None, record_stream=None, upstream_event=None, upstream_bytes=None):
         self.root = Path(root)
         self.objects = self.root / "objects"
         self.objects.mkdir(parents=True, exist_ok=True)
@@ -116,6 +117,8 @@ class MediaCache:
         self.api_json = api_json
         self.activity = activity or (lambda user_id: None)
         self.record_stream = record_stream or (lambda user_id, url: None)
+        self.upstream_event = upstream_event or (lambda **value: None)
+        self.upstream_bytes = upstream_bytes or (lambda count: None)
         self.max_bytes, self.min_free, self.max_segment = max_bytes, min_free, max_segment
         self.downloads = threading.BoundedSemaphore(downloads)
         self.resolves = threading.BoundedSemaphore(4)
@@ -124,6 +127,7 @@ class MediaCache:
         self.db_lock = threading.RLock()
         self.state_lock = threading.Lock()
         self.identities, self.tickets = {}, {}
+        self.active_tracks, self.readers = {}, {}
         self.counts = {"cache_hits": 0, "cache_misses": 0, "upstream_bytes": 0,
                        "served_bytes": 0, "resolves": 0, "stream_requests": 0, "active_downloads": 0,
                        "peak_downloads": 0}
@@ -131,6 +135,8 @@ class MediaCache:
         self.opener = urllib.request.build_opener(SafeRedirect())
         with self.db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS objects (key TEXT PRIMARY KEY,size INTEGER,last_used REAL)")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(objects)")}
+            if "hits" not in columns: db.execute("ALTER TABLE objects ADD COLUMN hits INTEGER NOT NULL DEFAULT 0")
             db.execute("CREATE TABLE IF NOT EXISTS manifests (urn TEXT PRIMARY KEY,data TEXT)")
             db.execute("CREATE TABLE IF NOT EXISTS traffic (month TEXT PRIMARY KEY,served INTEGER NOT NULL)")
         # Partial downloads are never served, including after an interrupted deploy.
@@ -140,7 +146,7 @@ class MediaCache:
             for path in self.objects.glob("*.seg"):
                 if re.fullmatch(r"[a-f0-9]{64}\.seg", path.name):
                     stat = path.stat()
-                    db.execute("INSERT OR IGNORE INTO objects VALUES (?,?,?)", (path.stem, stat.st_size, stat.st_mtime))
+                    db.execute("INSERT OR IGNORE INTO objects(key,size,last_used) VALUES (?,?,?)", (path.stem, stat.st_size, stat.st_mtime))
         self.prune()
 
     @contextmanager
@@ -190,7 +196,11 @@ class MediaCache:
         if token and urllib.parse.urlsplit(url).hostname == "api.soundcloud.com":
             headers["Authorization"] = "OAuth " + token
         try:
-            return self.opener.open(urllib.request.Request(url, headers=headers), timeout=10)
+            response = open_read(self.opener, urllib.request.Request(url, headers=headers), timeout=10,
+                                 event=self.upstream_event, read_bytes=self.upstream_bytes)
+            if response.status >= 400:
+                raise urllib.error.HTTPError(url, response.status, "Upstream error", response.headers, response)
+            return response
         except urllib.error.HTTPError as error:
             code = error.code
             error.close()
@@ -265,6 +275,10 @@ class MediaCache:
         if not self.permitted(entry["user"]):
             raise MediaError(403, "Access to Fastcloud was disabled by the owner")
         self.activity(entry["user"])
+        with self.state_lock:
+            now = time.monotonic()
+            self.active_tracks = {urn: expires for urn, expires in self.active_tracks.items() if expires > now}
+            self.active_tracks[entry["urn"]] = now + 60
         return entry
 
     def playlist(self, value):
@@ -278,12 +292,19 @@ class MediaCache:
         return (self.objects / (key + ".seg")).is_file()
 
     def prune(self, reserve=0):
+        with self.state_lock:
+            active = {urn for urn, expires in self.active_tracks.items() if expires > time.monotonic()}
+            protected = {asset["key"] for ticket in self.tickets.values() if ticket["urn"] in active for asset in ticket["manifest"]["assets"]}
+            protected.update(self.readers)
         with self.db() as db:
             total = db.execute("SELECT COALESCE(SUM(size),0) FROM objects").fetchone()[0]
             free = shutil.disk_usage(self.root).free
-            for key, size in db.execute("SELECT key,size FROM objects ORDER BY last_used").fetchall():
+            # Frequency grants at most two days of preference, so stale popular
+            # recordings eventually leave too. Active playback always wins.
+            for key, size in db.execute("SELECT key,size FROM objects ORDER BY last_used + MIN(hits,48)*3600").fetchall():
                 if total + reserve <= self.max_bytes and free - reserve >= self.min_free:
                     break
+                if key in protected: continue
                 path = self.objects / (key + ".seg")
                 with self.keys.lock:
                     if "segment:" + key in self.keys.entries:
@@ -357,7 +378,7 @@ class MediaCache:
                         # Concurrent completed segments are accounted before reserving new ones.
                         os.replace(partial, path)
                         with self.db() as db:
-                            db.execute("INSERT INTO objects VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET size=excluded.size,last_used=excluded.last_used",
+                            db.execute("INSERT INTO objects(key,size,last_used) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET size=excluded.size,last_used=excluded.last_used",
                                        (key, size, time.time()))
                 finally:
                     partial.unlink(missing_ok=True)
@@ -365,11 +386,13 @@ class MediaCache:
                         self.counts["active_downloads"] -= 1
                     self.downloads.release()
             with self.db() as db:
-                db.execute("UPDATE objects SET last_used=? WHERE key=?", (time.time(), key))
+                db.execute("UPDATE objects SET last_used=?,hits=hits+1 WHERE key=?", (time.time(), key))
             # Hold an open descriptor while leaving the lock: eviction cannot truncate
             # a response being streamed (Unix keeps the inode alive until close).
             stream = path.open("rb")
-            return stream, os.fstat(stream.fileno()).st_size
+            with self.state_lock:
+                self.readers[key] = self.readers.get(key, 0) + 1
+            return PlaybackReader(stream, self, key), os.fstat(stream.fileno()).st_size
 
     def record_served(self, count):
         with self.state_lock:
@@ -389,3 +412,22 @@ class MediaCache:
         return {**counts, "since": self.started, "cache_bytes": size, "cache_objects": objects,
                 "cache_limit_bytes": self.max_bytes, "free_disk_bytes": shutil.disk_usage(self.root).free,
                 "traffic_month": month, "month_served_bytes": traffic[0] if traffic else 0}
+
+
+class PlaybackReader:
+    def __init__(self, stream, cache, key):
+        self.stream, self.cache, self.key, self.closed = stream, cache, key, False
+
+    def __getattr__(self, name): return getattr(self.stream, name)
+
+    def close(self):
+        if self.closed: return
+        self.closed = True
+        self.stream.close()
+        with self.cache.state_lock:
+            remaining = self.cache.readers.get(self.key, 1) - 1
+            if remaining: self.cache.readers[self.key] = remaining
+            else: self.cache.readers.pop(self.key, None)
+
+    def __enter__(self): return self
+    def __exit__(self, *_): self.close()

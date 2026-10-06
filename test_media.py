@@ -30,6 +30,21 @@ class Response(io.BytesIO):
 
 
 class MediaTest(unittest.TestCase):
+    def test_frequency_bonus_and_open_reader_protect_cached_segments(self):
+        result=self.cache.resolve('soundcloud:tracks:7','token');ticket=self.ticket(result)
+        assets=self.cache.ticket(ticket)['manifest']['assets'];key=assets[-1]['key']
+        stream,size=self.cache.segment(ticket,key)
+        self.cache.active_tracks.clear();self.cache.max_bytes=1
+        with self.assertRaises(MediaError):self.cache.prune()
+        self.assertTrue(self.cache.contains(key));self.assertEqual(stream.read(),b'audio'*50)
+        stream.close();self.cache.prune();self.assertFalse(self.cache.contains(key))
+        self.cache.max_bytes=100
+        for index,hits in enumerate((20,0)):
+            key=f'{index:064x}';(self.cache.objects/(key+'.seg')).write_bytes(b'x'*100)
+            with self.cache.db() as db:db.execute('INSERT INTO objects(key,size,last_used,hits) VALUES(?,?,?,?)',(key,100,time.time()-(100 if hits else 0),hits))
+        self.cache.prune()
+        self.assertTrue(self.cache.contains(f'{0:064x}'));self.assertFalse(self.cache.contains(f'{1:064x}'))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.allowed = {42}
@@ -187,6 +202,10 @@ class MediaTest(unittest.TestCase):
         self.download(ticket, assets[0]["key"])
         self.download(ticket, assets[1]["key"])
         self.cache.max_bytes = 250
+        # An active recording must survive even a forced quota reduction.
+        with self.assertRaises(MediaError): self.cache.prune()
+        self.assertTrue(all(self.cache.contains(asset["key"]) for asset in assets))
+        self.cache.active_tracks.clear()
         self.cache.prune()
         self.assertLessEqual(self.cache.stats()["cache_bytes"], 250)
         self.assertEqual(protected.read_bytes(), b"approval data")
