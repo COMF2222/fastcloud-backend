@@ -57,11 +57,14 @@ def activate(db, uid, profile):
 
 def person(db, uid):
     row = db.execute("SELECT id,username,avatar_url,permalink_url FROM chat_profiles WHERE id=?",(uid,)).fetchone()
+    # Approved Fastcloud accounts are discoverable even before their first
+    # chat-capable client starts. Activation enriches this trusted identity.
+    if not row: row = db.execute("SELECT id,username,NULL,NULL FROM users WHERE id=?",(uid,)).fetchone()
     return dict(zip(("id","username","avatarUrl","permalinkUrl"),row)) if row else None
 
 
 def available(db, uid):
-    return bool(db.execute("SELECT 1 FROM chat_profiles p JOIN users u ON u.id=p.id WHERE p.id=? AND u.status='approved'",(uid,)).fetchone())
+    return bool(db.execute("SELECT 1 FROM users WHERE id=? AND status='approved'",(uid,)).fetchone())
 
 
 def blocked(db, uid, peer):
@@ -239,7 +242,7 @@ class Service:
         except (ChatError,MediaError,TimeoutError): following=set();degraded=True
         with self.db_lock,self.database() as db:
             peers=[]
-            for row in db.execute("SELECT p.id FROM chat_profiles p JOIN users u ON u.id=p.id WHERE p.id!=? AND u.status='approved' ORDER BY p.username",(uid,)):
+            for row in db.execute("SELECT u.id FROM users u LEFT JOIN chat_profiles p ON p.id=u.id WHERE u.id!=? AND u.status='approved' ORDER BY COALESCE(p.username,u.username),u.id",(uid,)):
                 if row[0] in following and not blocked(db,uid,row[0]): peers.append(row[0])
                 if len(peers)>=200: break
             blocked_people=[person(db,row[0]) for row in db.execute("SELECT peer FROM chat_blocks WHERE owner=?",(uid,))]

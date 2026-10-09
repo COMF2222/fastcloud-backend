@@ -80,6 +80,40 @@ class GatewayTest(unittest.TestCase):
         with self.assertRaises(ValueError):service.attachment({"kind":"track","id":7,"title":"Spoofed"},"fixture")
         service.get.return_value["sharing"]="private"
         with self.assertRaises(chat.ChatError):service.attachment({"kind":"track","id":7},"fixture")
+    def test_registered_mutual_friend_is_discoverable_before_chat_activation(self):
+        from contextlib import contextmanager
+        from unittest.mock import Mock
+        import threading
+        db=sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY,username TEXT,status TEXT,updated_at INTEGER)")
+        db.executemany("INSERT INTO users VALUES (?,?,?,0)",[(1,"One","approved"),(2,"harlow2k","approved"),(3,"Denied","denied"),(4,"Not mutual","approved")])
+        chat.initialize(db)
+        chat.activate(db,1,{"id":1,"username":"One"})
+        @contextmanager
+        def database():
+            with db: yield db
+        service=chat.Service(database,threading.RLock(),None)
+        service.following_ids=Mock(return_value={2,3,4})
+        service.mutual=Mock(side_effect=lambda uid,peer,token: peer==2)
+        result=service.contacts(1,"fixture")
+        self.assertEqual([peer["id"] for peer in result["contacts"]],[2])
+        self.assertEqual(result["contacts"][0]["username"],"harlow2k")
+        self.assertIsNone(result["contacts"][0]["avatarUrl"])
+        self.assertFalse(result["degraded"])
+        self.assertTrue(chat.available(db,2))
+        thread=chat.open_thread(db,1,2)
+        chat.send(db,1,thread["id"],{"text":"hello","nonce":"a"*32,"attachment":None})
+        self.assertEqual(chat.inbox(db,2)["unread"],1)
+        chat.activate(db,2,{"id":2,"username":"Updated name","avatar_url":"https://i1.sndcdn.com/avatar.jpg"})
+        self.assertEqual(service.contacts(1,"fixture")["contacts"][0]["username"],"Updated name")
+        chat.block(db,2,1,True)
+        self.assertFalse(service.contacts(1,"fixture")["contacts"])
+        chat.block(db,2,1,False)
+        db.execute("UPDATE users SET status='denied' WHERE id=2")
+        self.assertFalse(service.contacts(1,"fixture")["contacts"])
+        with self.assertRaises(chat.ChatError): chat.send(db,1,thread["id"],{"text":"no","nonce":"b"*32,"attachment":None})
+        db.close()
+
     def test_followings_pagination_includes_contacts_after_first_page(self):
         from unittest.mock import Mock
         service=chat.Service(None,None,None)
