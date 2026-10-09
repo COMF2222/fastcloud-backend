@@ -176,7 +176,7 @@ not proxy account passwords or bypass SoundCloud track availability.
 
 Authenticated `GET` / `POST /v1/me/personal` store per-account portable settings,
 custom appearance presets, quick-access pins, playlist folders, smart-playlist
-rules, new-like dates and personal listening counters in the existing SQLite
+rules, new-like dates, disliked tracks and personal listening counters in the existing SQLite
 volume. The route derives identity from the OAuth token and checks access through
 the same relay authorization flow; clients cannot select another user's ID.
 
@@ -184,6 +184,23 @@ POST patches individual keys, preserving unrelated fields. Null folder/rule
 values delete that entity. Fields such as credentials, local wallpaper/font paths
 and downloaded audio are rejected. Limits are 2 MiB per body, 100 folders,
 50 smart rules and 100 listening records per upload.
+
+`trackFeedback` patches use track IDs as keys and records shaped as
+`{disliked, updatedAt, device, track}`. `updatedAt` is UTC milliseconds; ties use
+the device identifier so replays have deterministic results. The server retains
+`disliked: false` records, preventing an older offline device from restoring a
+removed dislike. A batch accepts 100 ratings; each account can retain 5000.
+Track metadata contains only `id`, `title`, `artist`, `durationMs`, `genre`, `isrc`,
+`artworkUrl` and `permalinkUrl`; URLs must be public SoundCloud/Sndcdn HTTPS URLs
+without credentials or query strings. Tokens, descriptions and private stream
+URLs are never stored. Clients keep a per-account offline cache and upload
+pending changes on reconnect. Existing local dislikes migrate once; legacy
+ratings use timestamp zero so newer server decisions win.
+
+SoundCloud remains the source of truth for likes, followed accounts and native
+playlists. Fastcloud relays those authenticated API calls; the personal database
+stores application-specific feedback/preferences/collections and listening
+history summaries, rather than a competing copy of SoundCloud account state.
 
 Statistics use cumulative counters keyed by user/device/UTC day/track; retries
 take the maximum rather than adding again. Different devices add independently.

@@ -1,8 +1,47 @@
 import sqlite3
 import unittest
 import personal
+import time
+
+def feedback(disliked=True, updated=None, device='a' * 32):
+    return {'disliked': disliked, 'updatedAt': updated or int(time.time() * 1000), 'device': device,
+            'track': {'id': 42, 'title': 'Fixture song', 'artist': 'Fixture artist', 'durationMs': 180000,
+                      'genre': 'Rock', 'isrc': None, 'artworkUrl': 'https://i1.sndcdn.com/fixture.jpg',
+                      'permalinkUrl': 'https://soundcloud.com/fixture/song'}}
 
 class PersonalTest(unittest.TestCase):
+    def test_feedback_is_shared_between_devices_but_isolated_between_accounts(self):
+        item = feedback()
+        personal.write(self.db, 1, {'trackFeedback': {'42': item}})
+        self.assertEqual(personal.read(self.db, 1)['trackFeedback']['42'], item)
+        self.assertEqual(personal.read(self.db, 2)['trackFeedback'], {})
+
+    def test_restoring_a_dislike_survives_an_old_offline_device_retry(self):
+        now = int(time.time() * 1000)
+        old = feedback(updated=now - 1000)
+        restored = feedback(False, now, 'b' * 32)
+        personal.write(self.db, 1, {'trackFeedback': {'42': old}})
+        personal.write(self.db, 1, {'trackFeedback': {'42': restored}})
+        personal.write(self.db, 1, {'trackFeedback': {'42': old}})
+        self.assertFalse(personal.read(self.db, 1)['trackFeedback']['42']['disliked'])
+
+    def test_feedback_rejects_private_urls_mismatched_ids_and_unknown_metadata(self):
+        mutations = [('secret', {'secret_token': 'private'}),
+                     ('url', {'artworkUrl': 'https://i1.sndcdn.com/image?oauth_token=private'}),
+                     ('id', {'id': 43})]
+        for _, fields in mutations:
+            item = feedback()
+            item['track'].update(fields)
+            with self.assertRaises(ValueError): personal.validate({'trackFeedback': {'42': item}})
+        with self.assertRaises(ValueError): personal.validate({'trackFeedback': {'42': feedback(updated=int(time.time()*1000)+600000)}})
+
+    def test_feedback_device_tie_break_is_order_independent(self):
+        now = int(time.time()*1000)
+        old, new = feedback(True,now,'a'*32), feedback(False,now,'b'*32)
+        for user, rows in [(1,[old,new]),(2,[new,old])]:
+            for row in rows: personal.write(self.db,user,{'trackFeedback':{'42':row}})
+        self.assertEqual(personal.read(self.db,1)['trackFeedback'],personal.read(self.db,2)['trackFeedback'])
+
     def setUp(self):
         self.db = sqlite3.connect(":memory:")
         personal.initialize(self.db)

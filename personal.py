@@ -2,6 +2,7 @@
 import json
 import re
 import time
+import urllib.parse
 from datetime import date, datetime, timezone
 
 MAX_BODY = 2 * 1024 * 1024
@@ -74,12 +75,15 @@ def preference(key, value):
         if key in {"panel_blur", "background_blur", "crossfade_ms"} and type(value) is not int: raise ValueError("Expected an integer")
 
 def validate(body):
-    if not isinstance(body, dict) or set(body) - {"preferences", "folders", "smartPlaylists", "likedAt", "device", "stats"}: raise ValueError("Invalid personal data fields")
-    for section in ["preferences", "folders", "smartPlaylists", "likedAt"]:
+    if not isinstance(body, dict) or set(body) - {"preferences", "folders", "smartPlaylists", "likedAt", "trackFeedback", "device", "stats"}: raise ValueError("Invalid personal data fields")
+    for section in ["preferences", "folders", "smartPlaylists", "likedAt", "trackFeedback"]:
         items = body.get(section, {})
         if not isinstance(items, dict) or len(items) > 100: raise ValueError("Invalid personal data section")
         for key, value in items.items():
             if section == "preferences": preference(key, value); continue
+            if section == "trackFeedback":
+                validate_feedback(key, value)
+                continue
             if section == "likedAt":
                 if not key.isdecimal() or not 0 < int(key) <= 2**53-1: raise ValueError("Invalid liked track")
                 integer(value, int(time.time()) + 300); continue
@@ -109,8 +113,37 @@ def validate(body):
         text(row["title"], 512); text(row["artist"], 256); text(row["genre"], 128)
         integer(row["ms"], 86400000); integer(row["plays"], 2880); integer(row["lastPlayed"], int(time.time()) + 300)
 
+def validate_feedback(key, value):
+    if not key.isdecimal() or not 0 < int(key) <= 2**53-1:
+        raise ValueError("Invalid feedback track")
+    if not isinstance(value, dict) or set(value) != {"disliked", "updatedAt", "device", "track"}:
+        raise ValueError("Invalid track feedback fields")
+    if type(value["disliked"]) is not bool:
+        raise ValueError("Invalid track feedback toggle")
+    integer(value["updatedAt"], int(time.time() * 1000) + 300000)
+    if not re.fullmatch(r"[a-f0-9]{32}", text(value["device"], 32)):
+        raise ValueError("Invalid feedback device")
+    track = value["track"]
+    if not isinstance(track, dict) or set(track) != {"id", "title", "artist", "durationMs", "genre", "artworkUrl", "permalinkUrl", "isrc"}:
+        raise ValueError("Invalid feedback track metadata")
+    if integer(track["id"], 2**53-1) != int(key):
+        raise ValueError("Feedback track ID mismatch")
+    text(track["title"], 512); text(track["artist"], 256); text(track["genre"], 128)
+    integer(track["durationMs"], 86400000)
+    if track["isrc"] is not None and (not isinstance(track["isrc"], str) or not re.fullmatch(r"[A-Z0-9]{12}",track["isrc"])):
+        raise ValueError("Invalid recording code")
+    for field in ("artworkUrl", "permalinkUrl"):
+        if track[field] is None: continue
+        raw = text(track[field], 1024)
+        url = urllib.parse.urlsplit(raw)
+        host = (url.hostname or "").lower()
+        allowed = (host == "sndcdn.com" or host.endswith(".sndcdn.com")) if field == "artworkUrl" else host in {"soundcloud.com", "www.soundcloud.com"}
+        if url.scheme != "https" or not allowed or url.username or url.password or url.query or url.fragment or url.port not in (None, 443):
+            raise ValueError("Invalid public feedback URL")
+
+
 def read(db, user_id):
-    result = {"preferences": {}, "folders": {}, "smartPlaylists": {}, "likedAt": {}}
+    result = {"preferences": {}, "folders": {}, "smartPlaylists": {}, "likedAt": {}, "trackFeedback": {}}
     for section, key, value in db.execute("SELECT section,key,value FROM personal_fields WHERE user_id=?", (user_id,)):
         result[section][key] = json.loads(value)
     # Daily totals for the chart; lifetime track totals remain independent of chart range.
@@ -121,15 +154,20 @@ def read(db, user_id):
 
 def write(db, user_id, body):
     validate(body)
-    for section in ["preferences", "folders", "smartPlaylists", "likedAt"]:
+    for section in ["preferences", "folders", "smartPlaylists", "likedAt", "trackFeedback"]:
         for key, value in body.get(section, {}).items():
             if section == "likedAt":
                 previous = db.execute("SELECT value FROM personal_fields WHERE user_id=? AND section=? AND key=?", (user_id, section, key)).fetchone()
                 value = max(value, json.loads(previous[0]) if previous else 0)
+            if section == "trackFeedback":
+                previous = db.execute("SELECT value FROM personal_fields WHERE user_id=? AND section=? AND key=?", (user_id, section, key)).fetchone()
+                if previous:
+                    old = json.loads(previous[0])
+                    if (old["updatedAt"], old["device"]) >= (value["updatedAt"], value["device"]): continue
             db.execute("INSERT INTO personal_fields VALUES (?,?,?,?) ON CONFLICT(user_id,section,key) DO UPDATE SET value=excluded.value", (user_id, section, key, json.dumps(value, ensure_ascii=False)))
     for row in body.get("stats", []):
         db.execute("INSERT INTO listening VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,device,day,track_id) DO UPDATE SET ms=MAX(ms,excluded.ms),plays=MAX(plays,excluded.plays),last_played=MAX(last_played,excluded.last_played),title=excluded.title,artist=excluded.artist,genre=excluded.genre", (user_id, body["device"], row["day"], row["trackId"], row["title"], row["artist"], row["genre"], row["ms"], row["plays"], row["lastPlayed"]))
-    for section, limit in [("folders", 100), ("smartPlaylists", 50)]:
+    for section, limit in [("folders", 100), ("smartPlaylists", 50), ("trackFeedback", 5000)]:
         count = db.execute("SELECT COUNT(*) FROM personal_fields WHERE user_id=? AND section=? AND value!='null'", (user_id, section)).fetchone()[0]
         if count > limit: raise ValueError("Too many saved collections")
     # Deleted entities need no permanent tombstone because requests patch individual IDs.
