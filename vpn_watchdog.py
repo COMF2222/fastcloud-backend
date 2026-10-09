@@ -14,6 +14,14 @@ RESTART_WINDOW = 3600
 RESTART_LIMIT = 3
 COMPOSE_FILES = ("compose.ip.yaml", "compose.vpn.yaml")
 
+
+def systemd_dropin(project):
+    # WorkingDirectory is a path directive, not an ExecStart command line.
+    # Surrounding quotes become literal characters and invalidate absolute paths.
+    if not project.startswith("/") or any(char in project for char in "\n\r\0"):
+        raise ValueError("Invalid absolute project directory")
+    return "[Service]\nWorkingDirectory=" + project.replace("%", "%%") + "\n"
+
 # Runs inside fastcloud, with its actual proxy and CA configuration. No OAuth,
 # SoundCloud stream requests, response bodies or private config enter the logs.
 PROBE = r'''
@@ -109,10 +117,15 @@ def run_once(project, state_path, runner=subprocess.run, now=None):
     for service in ("fastcloud", "mihomo"):
         running = runner([*compose, "ps", "--status", "running", "-q", service],
                          capture_output=True, text=True, timeout=15)
-        if running.returncode or not running.stdout.strip():
+        if running.returncode:
             state["failures"] = 0
             save_state(state_path, state)
-            print("VPN check skipped: required service not running or Docker unavailable")
+            print(f"VPN check unavailable: Docker Compose failed for {service} (exit {running.returncode}); no restart requested")
+            return 1
+        if not running.stdout.strip():
+            state["failures"] = 0
+            save_state(state_path, state)
+            print(f"VPN check skipped: {service} is not running")
             return 0
     result = runner([*compose, "exec", "-T", "fastcloud", "python", "-"],
                     input=PROBE, capture_output=True, text=True, timeout=25)

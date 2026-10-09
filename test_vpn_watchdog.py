@@ -8,6 +8,23 @@ import vpn_watchdog as watchdog
 
 
 class WatchdogTests(unittest.TestCase):
+    def test_systemd_directory_is_absolute_without_literal_quotes(self):
+        self.assertEqual(watchdog.systemd_dropin('/root/fastcloud-backend'),
+                         '[Service]\nWorkingDirectory=/root/fastcloud-backend\n')
+        self.assertEqual(watchdog.systemd_dropin('/srv/fastcloud space%name'),
+                         '[Service]\nWorkingDirectory=/srv/fastcloud space%%name\n')
+        for bad in ('relative/path', '/root/project\nExecStart=other', '/root/project\0'):
+            with self.assertRaises(ValueError):
+                watchdog.systemd_dropin(bad)
+
+    def test_docker_compose_failure_does_not_report_a_successful_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            runner = Mock(return_value=subprocess.CompletedProcess([], 1, '', 'private config error'))
+            self.assertEqual(watchdog.run_once(Path(directory), path, runner), 1)
+            self.assertEqual(runner.call_count, 1)
+            self.assertEqual(watchdog.load_state(path)['restarts'], [])
+
     def test_short_failure_recovers_without_restart(self):
         state = watchdog.initial_state()
         state, action = watchdog.evaluate(state, False, 1000)

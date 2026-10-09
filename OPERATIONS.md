@@ -28,6 +28,10 @@ journalctl -u fastcloud-vpn-watchdog.service -n 30 --no-pager
 No backend rebuild is needed. The installer copies the watchdog to
 `/usr/local/lib/fastcloud`, records this checkout's working directory in a systemd
 drop-in and enables the timer. Run the installer again after updating the watchdog.
+Installation validates the unit files, checks the working directory actually
+accepted by systemd and runs the service once before reporting success. An older
+installation with a quoted `WorkingDirectory` must be repaired by rerunning the
+updated installer; merely restarting the timer does not fix its configuration.
 The timer runs every minute after a 90-second boot grace period. From inside the
 backend, it checks two independent public HTTPS sites through `mihomo:7890`, using
 normal certificate validation and no OAuth credentials or stream API requests.

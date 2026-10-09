@@ -15,14 +15,19 @@ install -d -m 0755 /etc/systemd/system/fastcloud-vpn-watchdog.service.d
 python3 - "$project_dir" <<'PY'
 from pathlib import Path
 import sys
+sys.path.insert(0, '/usr/local/lib/fastcloud')
+from vpn_watchdog import systemd_dropin
 project = sys.argv[1]
-if '\n' in project or '\r' in project:
-    raise SystemExit('Unsupported newline in project directory')
-escaped = project.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%')
 Path('/etc/systemd/system/fastcloud-vpn-watchdog.service.d/project.conf').write_text(
-    '[Service]\nWorkingDirectory="' + escaped + '"\n', encoding='utf-8')
+    systemd_dropin(project), encoding='utf-8')
 PY
+systemd-analyze verify --man=no /etc/systemd/system/fastcloud-vpn-watchdog.service /etc/systemd/system/fastcloud-vpn-watchdog.timer
 systemctl daemon-reload
+if [[ "$(systemctl show fastcloud-vpn-watchdog.service -p WorkingDirectory --value)" != "$project_dir" ]]; then
+  echo 'Watchdog working directory was not accepted by systemd; installation failed.' >&2
+  exit 1
+fi
 systemctl enable --now fastcloud-vpn-watchdog.timer
+systemctl start fastcloud-vpn-watchdog.service
 echo 'VPN watchdog installed. Check: systemctl status fastcloud-vpn-watchdog.timer'
 echo 'Logs: journalctl -u fastcloud-vpn-watchdog.service -n 30 --no-pager'
