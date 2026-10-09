@@ -14,6 +14,8 @@ permission from SoundCloud and the relevant rights holders.
 For IP + VPN deployments, [automatic VPN recovery](OPERATIONS.md#automatic-vpn-recovery-ip--vpn-deployment)
 can monitor actual HTTPS egress and restart a stuck mihomo connection with a
 bounded retry budget. It is installed separately by the owner.
+For subscriptions with multiple nodes, [fastest healthy VPN selection](OPERATIONS.md#fastest-healthy-vpn-node-ip--vpn-deployment)
+chooses the working node with the lowest HTTPS latency to SoundCloud.
 
 1. Register your SoundCloud API app with redirect URI
    `http://127.0.0.1:41317/callback` (or set the exact URI in `.env`).

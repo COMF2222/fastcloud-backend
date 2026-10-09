@@ -12,6 +12,49 @@ bash deploy_checked.sh -f compose.ip.yaml -f compose.vpn.yaml
 
 The helper builds the backend image, checks required environment variable names and writable directories, trials migrations on temporary SQLite copies, creates a consistent snapshot of an existing account database, starts only `fastcloud`, then checks public status. It exits on any failed preflight. Existing proxy/VPN services stay running. First installation of the proxy/VPN still uses the normal compose `up -d` procedure. A failed health check does not automatically restore a live database or erase data. Keep the previous image until the check succeeds; use the previous Git commit and rebuild for code rollback. Test any schema rollback on a restored copy first.
 
+## Fastest healthy VPN node (IP + VPN deployment)
+
+Mihomo's `url-test` group selects the lowest-latency available node. Configure the
+existing subscription nodes from the server checkout:
+
+```bash
+cd ~/fastcloud-backend
+python3 configure_vpn_failover.py --apply && docker compose -f compose.ip.yaml -f compose.vpn.yaml up -d --no-deps --force-recreate mihomo
+```
+
+The host helper needs PyYAML (`apt-get install python3-yaml` if it is missing).
+Without `--apply`, it prints only counts/settings and changes nothing. With
+`--apply`, it identifies the group used by the default MATCH rule, includes all
+configured VPN nodes/providers in that group and enables HTTPS latency checks
+against `https://soundcloud.com/robots.txt` every 60 seconds with a five-second
+timeout, zero switching tolerance and `lazy: false`. Only HTTP 200 is healthy;
+nodes that connect but cannot reach SoundCloud are excluded. Provider nodes get
+their own health checks because group checks do not cover nodes referenced via
+`use`. Failed connections can trigger an earlier check (`max-failed-times: 1`).
+This measures HTTPS request latency from the VPS, not an ICMP ping or an estimate
+of bandwidth. Switching affects new connections; an existing stream may need to
+retry if its node has failed. When all nodes are down there is no working route.
+
+Node credentials, subscription URLs, listener/DNS settings and routing rules are
+preserved. Direct/reject pseudo-nodes are excluded from automatic membership.
+The helper validates the candidate with the actual running `/mihomo -t` before
+writing it and retains the exact previous bytes in a private
+`vpn/config.yaml.backup-*` file. The whole `vpn/` directory is ignored by Git.
+No private config or validator output is printed. Concurrent owner edits abort
+the update. Unsupported or ambiguous routing layouts are rejected unchanged.
+
+The final `--force-recreate mihomo` is necessary: configuration replacement is
+atomic, and restarting a container with a single-file bind mount can keep the
+previous file inode mounted. Other services and the database are not recreated.
+The existing watchdog remains as a bounded recovery mechanism for a stuck
+process; ordinary node selection runs inside Mihomo without container restarts.
+Inline nodes use the list currently in the config; provider subscriptions retain
+their existing refresh settings.
+
+References: [url-test](https://wiki.metacubex.one/en/config/proxy-groups/url-test/),
+[group health checks](https://wiki.metacubex.one/en/config/proxy-groups/),
+[provider health checks](https://wiki.metacubex.one/en/config/proxy-providers/).
+
 ## Automatic VPN recovery (IP + VPN deployment)
 
 The `unless-stopped` policy restarts a crashed process, but cannot detect a running

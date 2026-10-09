@@ -1,5 +1,5 @@
 .env
-vpn/config.yaml
+vpn/
 *.sqlite3*
 __pycache__/
 .pytest_cache/
