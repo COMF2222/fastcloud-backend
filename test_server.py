@@ -79,6 +79,44 @@ class BrokerTest(unittest.TestCase):
             status, value = self.call('/v1/me/personal', token="fixture-two")
             self.assertEqual(status,200)
             self.assertEqual(value['preferences'],{})
+    def test_chat_routes_enforce_mutual_following_membership_and_idempotency(self):
+        import chat
+        with server.DB_LOCK, server.database() as db:
+            db.executemany("INSERT OR REPLACE INTO users VALUES (?,?,?,0)", [(1,"One","approved"),(2,"Two","approved"),(3,"Third","approved")])
+            for uid in (1,2,3): chat.activate(db,uid,{"id":uid,"username":str(uid)})
+        service=server.chat_service()
+        def who(authorization):
+            if not authorization.startswith("OAuth "): raise server.MediaError(401,"Sign in")
+            return int(authorization[6:]), "fixture"
+        with patch.object(server.RELAY,"identity",side_effect=who),patch.object(service,"mutual",return_value=False) as mutual:
+            self.assertEqual(self.call('/v1/chat/inbox')[0],401)
+            status,value=self.call('/v1/chat/threads',{"peerId":2},token="1")
+            self.assertEqual(status,403);self.assertEqual(value['code'],'mutual_required')
+            mutual.return_value=True
+            status,thread=self.call('/v1/chat/threads',{"peerId":2},token="1")
+            self.assertEqual(status,200)
+            path=f"/v1/chat/threads/{thread['id']}/messages"
+            payload={"text":"private fixture","nonce":"a"*32,"attachment":None}
+            status,first=self.call(path,payload,token="1");self.assertEqual(status,200)
+            self.assertEqual(self.call(path,token="3")[0],404)
+            self.assertEqual(self.call(path,{**payload,"senderId":2},token="1")[0],400)
+            mutual.return_value=False
+            status,retried=self.call(path,payload,token="1")
+            self.assertEqual(status,200);self.assertEqual(first['id'],retried['id'])
+            self.assertEqual(self.call(path,{**payload,"nonce":"b"*32},token="1")[0],403)
+            status,history=self.call(path,token="2")
+            self.assertEqual(status,200);self.assertEqual(len(history['messages']),1)
+            self.assertFalse(history['canSend'])
+            self.assertEqual(self.call(f"/v1/chat/threads/{thread['id']}/read",{"through":first['id']},token="2")[0],200)
+            self.assertEqual(self.call(f"/v1/chat/threads/{thread['id']}/report",{"reason":"spam"},token="2")[0],200)
+            with patch.object(server,"profile",side_effect=lambda token:(int(token),token,"owner" if token=="1" else "listener")):
+                self.assertEqual(self.call('/v1/admin/chat/reports',token="3")[0],403)
+                status,reports=self.call('/v1/admin/chat/reports',token="1")
+                self.assertEqual(status,200);self.assertEqual(reports['reports'][0]['messages'][0]['text'],'private fixture')
+            self.assertEqual(self.call('/v1/chat/inbox',token="2")[1]['unread'],0)
+            denied=self.call('/v1/chat/activate',{"id":3},token="1")
+            self.assertEqual(denied[0],400)
+
     def setUp(self):
         owner = patch.object(server, "ADMIN_SLUG", "owner")
         owner.start()

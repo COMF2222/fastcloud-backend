@@ -8,6 +8,7 @@ import secrets
 import signal
 import sqlite3
 import personal
+import chat
 import operations
 import backup
 import hashlib
@@ -62,6 +63,8 @@ REFRESHES = Flights(limit=64, cache_bytes=1024 * 1024)
 PROFILES = Flights(limit=128, cache_bytes=1024 * 1024)
 ACTIVITY_LOCK = threading.Lock()
 ACTIVITY = {}
+CHAT = None
+CHAT_LOCK = threading.Lock()
 ONLINE_SECONDS = 120
 RELAY = Relay(lambda user_id: media_permitted(user_id),
               record_served=lambda size: media_cache().record_served(size),
@@ -126,6 +129,7 @@ def database():
     connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS user_activity (user_id INTEGER PRIMARY KEY,last_seen INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS daily_stream_usage (day TEXT NOT NULL,user_id INTEGER NOT NULL,requests INTEGER NOT NULL,PRIMARY KEY(day,user_id))")
+    chat.initialize(connection)
     personal.initialize(connection)
     operations.initialize(connection)
     connection.commit()
@@ -137,6 +141,15 @@ def database():
         raise
     finally:
         connection.close()
+
+
+def chat_service():
+    global CHAT
+    with CHAT_LOCK:
+        if CHAT is None or CHAT.path != DB_PATH:
+            CHAT = chat.Service(database, DB_LOCK, RELAY)
+            CHAT.path = DB_PATH
+        return CHAT
 
 
 def soundcloud(url, *, token=None, form=None):
@@ -560,16 +573,31 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         polling = path == "/v1/oauth/pending"
         updates = path == "/v1/updates/events"
+        chatting = path.startswith("/v1/chat/")
         media = path.startswith("/v1/media/")
         relay = path.startswith("/v1/soundcloud/")
-        if not self.throttle("relay" if relay else "media" if media else "pending" if polling else "updates" if updates else "general",
-                             2400 if relay else 6000 if media else 300 if polling or updates else 120):
+        if not self.throttle("chat" if chatting else "relay" if relay else "media" if media else "pending" if polling else "updates" if updates else "general",
+                             1200 if chatting else 2400 if relay else 6000 if media else 300 if polling or updates else 120):
             return self.reply(429, {"error": "Too many requests"})
         try:
             if relay:
                 return RELAY.handle(self, path)
             if media:
                 return self.media_request(path)
+            if chatting:
+                user_id, token = RELAY.identity(self.headers.get("Authorization", ""))
+                return chat_service().handle(self, path, user_id, token)
+            if path == "/v1/admin/chat/reports" and self.command == "GET":
+                self.admin()
+                with DB_LOCK, database() as db:
+                    rows = db.execute("SELECT id,reporter,peer,thread_id,reason,created_at FROM chat_reports ORDER BY id DESC LIMIT 20").fetchall()
+                    reports = [dict(zip(("id","reporterId","peerId","threadId","reason","createdAt"), row)) for row in rows]
+                    for report in reports:
+                        report["reporter"]=chat.person(db,report["reporterId"])
+                        report["peer"]=chat.person(db,report["peerId"])
+                        messages=db.execute("SELECT * FROM chat_messages WHERE thread_id=? AND created_at<=? ORDER BY id DESC LIMIT 5",(report["threadId"],report["createdAt"])).fetchall()
+                        report["messages"]=[{**chat.message(row),"text":row[3][:1000]} for row in reversed(messages)]
+                return self.reply(200,{"reports":reports})
             if self.command == "GET" and path == "/health":
                 return self.reply(200, {"status": "ok"})
             if self.command == "GET" and path == "/v1/status":
@@ -681,6 +709,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(404, {"error": "User has not requested access"})
                 return self.reply(200, {"id": user_id, "status": status})
             return self.reply(404, {"error": "Unknown endpoint"})
+        except chat.ChatError as error:
+            status = 429 if error.code == "rate_limited" else 404 if error.code == "not_found" else 409 if error.code == "conflict" else 502 if error.code == "upstream" else 403
+            return self.reply(status, {"error":error.message,"code":error.code})
         except PermissionError as error:
             return self.reply(403, {"error": str(error)})
         except MediaError as error:

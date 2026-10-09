@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import urllib.parse
 from pathlib import Path
+import chat
 import personal
 import operations
 
@@ -42,7 +43,7 @@ def migration_trial(path, *, media=False):
                 else:
                     db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY,username TEXT,status TEXT,updated_at INTEGER)")
                     db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY,value TEXT)")
-                    personal.initialize(db); operations.initialize(db)
+                    personal.initialize(db); operations.initialize(db); chat.initialize(db)
             if db.execute("PRAGMA quick_check").fetchone()[0] != "ok": raise ValueError("Trial migration failed")
             return {"migration": "ok", "existing": path.exists()}
         finally:

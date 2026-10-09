@@ -208,3 +208,38 @@ The schema initializes automatically with the existing database; no environment
 variable or new database service is needed. Retain and back up the persistent
 approvals volume. Deploy this backend before releasing clients using account
 sync. Existing clients and routes remain compatible.
+
+## Fastcloud chat
+
+Private Fastcloud direct messages use the same approved OAuth identity and SQLite
+volume as personal data. Chat is activated by the supporting client on startup.
+Both people must be registered in chat and mutually follow each other on
+SoundCloud. Contacts and read-only relationship checks cache for 60 seconds;
+opening a conversation and sending a new message always recheck both directions.
+Blocks and account denial stop new delivery. Messages are not SoundCloud DMs.
+
+The `/v1/chat/` API supports contacts, conversation summaries, paginated history,
+text and public music attachments, read receipts, one-sided archive, blocks and
+reports. Sender IDs and attachment metadata are derived server-side. A per-sender
+nonce plus request hash prevents duplicate delivery and mismatched retries.
+Pasted public SoundCloud links get a music card when resolvable. Explicit private
+music attachments and arbitrary fetch URLs are rejected.
+
+Schema initialization and preflight cover `chat_profiles`, `chat_threads`,
+`chat_members`, `chat_messages`, `chat_blocks` and `chat_reports`, including the
+message request hash. Existing SQLite backups include these tables; preserve the
+persistent volume. No extra environment variables or database service are needed.
+
+Only thread participants can read history. The owner-only
+`GET /v1/admin/chat/reports` returns reported context (five recent messages per
+report, last 20 reports), rather than a general private-history browser. The
+client tells a reporter that recent messages will be included. Message bodies,
+paths and OAuth credentials are not logged; chat text is stored in SQLite without
+end-to-end encryption. Disabled users cannot access authenticated chat routes.
+
+Limits: 32 KiB request bodies, 4000 text characters, 50 messages per page, 100
+inbox summaries, 200 registered contact candidates, 30 new messages/minute and
+300/hour per sender. Cached retries do not use the send quota. Client polling is
+3 seconds for an open visible chat and 15 seconds for the visible inbox badge.
+The shared-IP request throttle has a separate chat bucket, while send quotas are
+per identity. Deploy this backend before distributing the supporting client.
