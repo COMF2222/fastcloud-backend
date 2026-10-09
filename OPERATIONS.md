@@ -12,6 +12,49 @@ bash deploy_checked.sh -f compose.ip.yaml -f compose.vpn.yaml
 
 The helper builds the backend image, checks required environment variable names and writable directories, trials migrations on temporary SQLite copies, creates a consistent snapshot of an existing account database, starts only `fastcloud`, then checks public status. It exits on any failed preflight. Existing proxy/VPN services stay running. First installation of the proxy/VPN still uses the normal compose `up -d` procedure. A failed health check does not automatically restore a live database or erase data. Keep the previous image until the check succeeds; use the previous Git commit and rebuild for code rollback. Test any schema rollback on a restored copy first.
 
+## Automatic VPN recovery (IP + VPN deployment)
+
+The `unless-stopped` policy restarts a crashed process, but cannot detect a running
+mihomo process with broken egress. Install the separate host timer as root, from
+the server checkout, after pulling these files:
+
+```bash
+cd ~/fastcloud-backend
+bash install_vpn_watchdog.sh
+systemctl status fastcloud-vpn-watchdog.timer --no-pager
+journalctl -u fastcloud-vpn-watchdog.service -n 30 --no-pager
+```
+
+No backend rebuild is needed. The installer copies the watchdog to
+`/usr/local/lib/fastcloud`, records this checkout's working directory in a systemd
+drop-in and enables the timer. Run the installer again after updating the watchdog.
+The timer runs every minute after a 90-second boot grace period. From inside the
+backend, it checks two independent public HTTPS sites through `mihomo:7890`, using
+normal certificate validation and no OAuth credentials or stream API requests.
+One working target is enough: an outage or blocking at only one site does not
+trigger a VPN restart. Both must fail in three consecutive checks. It then
+restarts **only mihomo**, at most once per five minutes and three attempts in any
+rolling hour. Persistent failure after the budget is exhausted is logged; the
+timer keeps probing and the budget becomes available as older attempts expire.
+Healthy checks clear the failure streak but retain the hourly attempt history.
+
+Probe execution failures, corrupt state and stopped containers do not request a
+restart. Docker is never asked to start an intentionally stopped service. The
+backend, user database, proxy and media cache are not restarted. This can recover
+a hung connection, but cannot repair an unavailable VPN node, expired VPN access
+or an invalid configuration. The outgoing route remains configured exclusively
+through mihomo; the watchdog never switches to a direct route.
+
+State and a process lock live in `/var/lib/fastcloud-vpn-watchdog`; logs contain
+only check/recovery results, not proxy credentials, upstream response bodies or
+Docker error details. The root service needs Docker access; the application does
+not receive the Docker socket or extra permissions. To pause automatic recovery:
+
+```bash
+systemctl disable --now fastcloud-vpn-watchdog.timer
+systemctl stop fastcloud-vpn-watchdog.service
+```
+
 ## Private monitoring
 
 The owner account sees Server health inside User management. `/v1/admin/operations` and `/v1/admin/incidents` require owner OAuth authentication on every request. Only public GET `/v1/status` and `/health` allow credential-free browser CORS access. Admin responses do not allow CORS or credentials. Public `/v1/status` contains only availability and intentionally published incident text, never users, account usage, disk, traffic, tokens or request paths.

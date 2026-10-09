@@ -1,0 +1,17 @@
+[Unit]
+Description=Fastcloud VPN egress check and bounded recovery
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/fastcloud/vpn_watchdog.py
+StateDirectory=fastcloud-vpn-watchdog
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=100
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true

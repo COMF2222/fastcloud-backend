@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Fastcloud VPN egress every minute
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=fastcloud-vpn-watchdog.service
+
+[Install]
+WantedBy=timers.target
