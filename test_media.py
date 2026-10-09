@@ -132,6 +132,23 @@ class MediaTest(unittest.TestCase):
         self.assertEqual(self.cache.stats()["peak_downloads"], 4)
         self.assertEqual(self.cache.stats()["active_downloads"], 0)
 
+    def test_restart_loses_audio_ticket_but_does_not_expire_account(self):
+        old = self.ticket(self.cache.resolve("soundcloud:tracks:7", "token"))
+        key = self.cache.ticket(old)["manifest"]["assets"][0]["key"]
+        self.cache = self.new_cache()
+        for operation in (lambda: self.cache.playlist(old), lambda: self.cache.segment(old, key)):
+            with self.assertRaises(MediaError) as error:
+                operation()
+            self.assertEqual(error.exception.status, 410)
+        new = self.ticket(self.cache.resolve("soundcloud:tracks:7", "token"))
+        self.assertNotEqual(old, new)
+        self.assertIn(b"/v1/media/", self.cache.playlist(new))
+        self.assertEqual(self.download(new, key), b"audio" * 50)
+        self.cache.tickets[new]["expires"] = 0
+        with self.assertRaises(MediaError) as error:
+            self.cache.playlist(new)
+        self.assertEqual(error.exception.status, 410)
+
     def test_completed_song_survives_restart_without_another_stream_request(self):
         ticket = self.ticket(self.cache.resolve("soundcloud:tracks:7", "token"))
         for asset in self.cache.ticket(ticket)["manifest"]["assets"]:

@@ -271,7 +271,7 @@ class MediaCache:
         with self.state_lock:
             entry = self.tickets.get(value)
         if not entry or entry["expires"] <= time.monotonic():
-            raise MediaError(401, "Playback session expired; start the track again")
+            raise MediaError(410, "Audio link expired; start the track again")
         if not self.permitted(entry["user"]):
             raise MediaError(403, "Access to Fastcloud was disabled by the owner")
         self.activity(entry["user"])
