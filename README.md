@@ -77,9 +77,18 @@ not a claim that the VPS's network has been verified for 50 sustained listeners.
 `POST /v1/media/resolve` takes `{"urn":"soundcloud:tracks:123"}` and an
 `Authorization: OAuth <listener-token>` header. After checking the user's
 access and this track's current official SoundCloud metadata, it returns a
-relative playlist path and the original AAC-160/MP3-128 bitrate. Private,
-preview, blocked and unsupported/encrypted HLS renditions use direct playback;
-they never enter the shared cache. There are no unofficial SoundCloud endpoints.
+relative playlist path and the selected AAC-160/MP3-128 bitrate. For a public
+preview, the server first searches the official API for a matching publicly
+playable full recording. Artist/title or ISRC, full duration and version markers
+must match; search hits and saved matches are rechecked with the listener's
+current token. Remixes, covers and short excerpts are rejected. A match is kept
+in `recording_matches` in the media SQLite database (IDs and metadata fingerprint
+only, no tokens or signed URLs), survives restart, and shares the selected
+recording's existing HLS cache across listeners. Search is limited to two queries,
+100 results per query and a 12-second lookup budget. Confirmed misses are held
+for ten minutes per listener. Removed matches trigger a new search.
+Private, blocked, unmatched previews and unsupported/encrypted HLS renditions
+use direct playback; their audio never enters the shared cache. There are no unofficial SoundCloud endpoints.
 
 Playlist paths contain random, expiring playback tickets, not OAuth tokens.
 Tickets only permit assets already resolved by the server and continue checking
@@ -118,7 +127,7 @@ The desktop tries shared playback first. Older/disabled/unreachable brokers
 fall back to the official direct stream with a short cooldown. An explicit
 owner denial never falls back. Offline saved playback remains local.
 
-Run `python -m unittest test_server test_media -q` before deployment. Tests cover
+Run `python -m unittest test_server test_media test_recordings -q` before deployment. Tests cover
 50 concurrent cache requests, four-fetch admission, real HTTP/ranges, restart,
 truncation, expiration, access-mode persistence and owner-only permissions.
 

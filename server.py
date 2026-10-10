@@ -107,7 +107,8 @@ def media_cache():
                 downloads=int(os.environ.get("FASTCLOUD_MEDIA_DOWNLOADS", "4")),
                 activity=touch_activity, record_stream=record_stream_request,
                 upstream_event=lambda **value: operation_service().upstream(**value),
-                upstream_bytes=lambda count: operation_service().add_bytes("upstream", count))
+                upstream_bytes=lambda count: operation_service().add_bytes("upstream", count),
+                recording_api=lambda url, token, timeout: soundcloud_request(url, token=token, timeout=timeout))
         return MEDIA
 
 
@@ -160,7 +161,7 @@ def soundcloud(url, *, token=None, form=None):
     return soundcloud_request(url, token=token, form=form)
 
 
-def soundcloud_request(url, *, token=None, form=None):
+def soundcloud_request(url, *, token=None, form=None, timeout=15):
     headers = {"Accept": "application/json; charset=utf-8"}
     data = None
     if token:
@@ -170,7 +171,7 @@ def soundcloud_request(url, *, token=None, form=None):
         data = urllib.parse.urlencode(form).encode()
     request = urllib.request.Request(url, data=data, headers=headers)
     try:
-        response = open_read(urllib.request, request, timeout=15,
+        response = open_read(urllib.request, request, timeout=timeout,
                              event=lambda **value: operation_service().upstream(**value),
                              read_bytes=lambda count: operation_service().add_bytes("upstream", count))
         if response.status >= 400:
@@ -198,6 +199,7 @@ def soundcloud_request(url, *, token=None, form=None):
         detail = " ".join(detail.split())[:180]
         suffix = f": {detail}" if detail else ""
         failure = UpstreamError(f"SoundCloud {stage} returned HTTP {error.code}{suffix}")
+        failure.status = error.code
         failure.expired = (error.code == 401 or error.code == 400 and (form or {}).get("grant_type") == "refresh_token" and response.get("error") == "invalid_grant")
         raise failure from None
 

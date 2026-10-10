@@ -16,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from upstream import open_read
+from recordings import RecordingMatches, duration as recording_duration, urn as recording_urn
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -108,7 +109,7 @@ def parse_playlist(text, base, urn, bitrate):
 class MediaCache:
     def __init__(self, root, profile, permitted, api_json, *, max_bytes=5 * 1024**3,
                  min_free=3 * 1024**3, downloads=4, max_segment=8 * 1024**2,
-                 activity=None, record_stream=None, upstream_event=None, upstream_bytes=None):
+                 activity=None, record_stream=None, upstream_event=None, upstream_bytes=None, recording_api=None):
         self.root = Path(root)
         self.objects = self.root / "objects"
         self.objects.mkdir(parents=True, exist_ok=True)
@@ -139,6 +140,7 @@ class MediaCache:
             if "hits" not in columns: db.execute("ALTER TABLE objects ADD COLUMN hits INTEGER NOT NULL DEFAULT 0")
             db.execute("CREATE TABLE IF NOT EXISTS manifests (urn TEXT PRIMARY KEY,data TEXT)")
             db.execute("CREATE TABLE IF NOT EXISTS traffic (month TEXT PRIMARY KEY,served INTEGER NOT NULL)")
+        self.matches = RecordingMatches(self.db, self.api_json, self.keys, timed_api=recording_api)
         # Partial downloads are never served, including after an interrupted deploy.
         for path in self.objects.glob("*.part"):
             path.unlink(missing_ok=True)
@@ -218,10 +220,16 @@ class MediaCache:
         if not self.resolves.acquire(timeout=5):
             raise MediaError(503, "Track resolution is busy")
         try:
-            # Recheck access with this listener's token even on a cache hit.
-            # Private, preview, removed and restricted tracks never enter the shared cache.
+            # Recheck source access with this listener even on a shared match/cache hit.
             path = "/tracks/" + urllib.parse.quote(urn, safe="")
             track = self.api_json("https://api.soundcloud.com" + path, token=token)
+            replacement = None
+            if track.get("sharing") == "public" and track.get("access") == "preview":
+                replacement = self.matches.find(urn, track, token, user_id)
+                if replacement:
+                    track = replacement
+                    urn = recording_urn(track)
+                    path = "/tracks/" + urllib.parse.quote(urn, safe="")
             if (track.get("sharing") != "public" or track.get("access") != "playable"
                     or not track.get("streamable") or track.get("policy") in ("BLOCK", "SNIP")):
                 raise MediaError(422, "This track requires direct SoundCloud playback")
@@ -263,7 +271,10 @@ class MediaCache:
                 self.tickets[ticket] = {"expires": now + 4 * 3600, "user": user_id, "manifest": manifest,
                                         "urn": urn, "token": token}
                 self.counts["resolves"] += 1
-            return {"playlist_path": f"/v1/media/{ticket}/index.m3u8", "bitrate_kbps": manifest["bitrate"]}
+            result = {"playlist_path": f"/v1/media/{ticket}/index.m3u8", "bitrate_kbps": manifest["bitrate"]}
+            if replacement:
+                result.update({"replacement_urn": urn, "duration_ms": recording_duration(track)})
+            return result
         finally:
             self.resolves.release()
 
