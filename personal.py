@@ -1,3 +1,4 @@
+import unicodedata
 """Portable per-account data. No credentials, local paths or audio are stored here."""
 import json
 import re
@@ -6,7 +7,9 @@ import urllib.parse
 from datetime import date, datetime, timezone
 
 MAX_BODY = 2 * 1024 * 1024
+EXTENDED_PREFERENCES = {"wave_mode", "wave_mood", "leaderboard_anonymous"}
 PREFERENCE_FIELDS = {
+    "wave_mode", "wave_mood", "leaderboard_anonymous",
     "theme", "language", "music_taste", "theme_presets", "quick_access", "accent_rgb",
     "panel_rgb", "panel_opacity", "panel_blur", "heading_opacity", "text_rgb", "muted_text_rgb",
     "interface_text_scale", "interface_scale", "background_opacity", "background_dim",
@@ -32,7 +35,13 @@ def integer(value, maximum):
 def preference(key, value):
     if key not in PREFERENCE_FIELDS:
         raise ValueError("Unknown portable preference")
-    if key.endswith("_rgb"):
+    if key == "wave_mode":
+        if not isinstance(value, str) or value not in {"Balanced", "Familiar", "Discover", "Mood", "NoRepeats"}: raise ValueError("Invalid wave mode")
+    elif key == "wave_mood":
+        if not isinstance(value, str) or value not in {"Calm", "Sad", "Happy", "Workout", "Road"}: raise ValueError("Invalid wave mood")
+    elif key == "leaderboard_anonymous":
+        if type(value) is not bool: raise ValueError("Invalid anonymity setting")
+    elif key.endswith("_rgb"):
         if value is None and key != "accent_rgb": return
         if not isinstance(value, list) or len(value) != 3: raise ValueError("Invalid colour")
         for channel in value: integer(channel, 255)
@@ -142,9 +151,10 @@ def validate_feedback(key, value):
             raise ValueError("Invalid public feedback URL")
 
 
-def read(db, user_id):
+def read(db, user_id, preference_version=1):
     result = {"preferences": {}, "folders": {}, "smartPlaylists": {}, "likedAt": {}, "trackFeedback": {}}
     for section, key, value in db.execute("SELECT section,key,value FROM personal_fields WHERE user_id=?", (user_id,)):
+        if section == "preferences" and key in EXTENDED_PREFERENCES and preference_version < 2: continue
         result[section][key] = json.loads(value)
     # Daily totals for the chart; lifetime track totals remain independent of chart range.
     result["daily"] = [{"day": day, "ms": ms, "plays": plays} for day, ms, plays in db.execute("SELECT day,SUM(ms),SUM(plays) FROM listening WHERE user_id=? GROUP BY day ORDER BY day DESC LIMIT 365", (user_id,))]
@@ -152,7 +162,7 @@ def read(db, user_id):
     result["totals"] = dict(zip(("ms", "plays"), db.execute("SELECT COALESCE(SUM(ms),0),COALESCE(SUM(plays),0) FROM listening WHERE user_id=?", (user_id,)).fetchone()))
     return result
 
-def write(db, user_id, body):
+def write(db, user_id, body, preference_version=1):
     validate(body)
     for section in ["preferences", "folders", "smartPlaylists", "likedAt", "trackFeedback"]:
         for key, value in body.get(section, {}).items():
@@ -172,4 +182,53 @@ def write(db, user_id, body):
         if count > limit: raise ValueError("Too many saved collections")
     # Deleted entities need no permanent tombstone because requests patch individual IDs.
     db.execute("DELETE FROM personal_fields WHERE user_id=? AND section IN ('folders','smartPlaylists') AND value='null'", (user_id,))
-    return read(db, user_id)
+    return read(db, user_id, preference_version)
+
+
+def artist_identity(name):
+    clean = " ".join(unicodedata.normalize("NFKC", name).split())
+    while clean and not clean[0].isalnum(): clean = clean[1:]
+    while clean and not clean[-1].isalnum(): clean = clean[:-1]
+    return clean.strip().lower(), clean.strip()
+
+
+def leaderboard(db, viewer_id, days=7, sort="time", now=None):
+    if days not in (0, 7, 30) or sort not in ("time", "plays"):
+        raise ValueError("Invalid leaderboard period or ordering")
+    now = int(time.time()) if now is None else now
+    today = datetime.fromtimestamp(now, timezone.utc).date()
+    start = date.fromordinal(today.toordinal() - days + 1).isoformat() if days else "2020-01-01"
+    end = today.isoformat()
+    people = {uid: {"name": name, "anonymous": True, "ms": 0, "plays": 0, "trackIds": set(), "artists": {}, "tracks": {}}
+              for uid, name in db.execute("SELECT id,username FROM users WHERE status='approved'")}
+    for uid, value in db.execute("SELECT user_id,value FROM personal_fields WHERE section='preferences' AND key='leaderboard_anonymous'"):
+        if uid in people: people[uid]["anonymous"] = json.loads(value) is not False
+    factors = {}
+    for uid, day, ms, plays in db.execute("SELECT user_id,day,SUM(ms),SUM(plays) FROM listening WHERE day>=? AND day<=? GROUP BY user_id,day", (start, end)):
+        if uid not in people or ms <= 0: continue
+        counted = min(ms, 86_400_000)
+        factors[(uid, day)] = counted / ms
+        people[uid]["ms"] += counted
+        people[uid]["plays"] += min(plays, counted // 30_000)
+    for uid, day, tid, title, artist, ms in db.execute("SELECT user_id,day,track_id,title,artist,SUM(ms) FROM listening WHERE day>=? AND day<=? GROUP BY user_id,day,track_id", (start, end)):
+        if (uid, day) not in factors or ms <= 0: continue
+        user = people[uid]; counted = int(ms * factors[(uid, day)])
+        user["trackIds"].add(tid)
+        key, display = artist_identity(artist)
+        if key:
+            group = user["artists"].setdefault(key, {"name": display, "ms": 0})
+            group["ms"] += counted
+        previous = user["tracks"].get(tid, {"title": title, "artist": artist, "ms": 0})
+        previous["ms"] += counted; user["tracks"][tid] = previous
+    ranking = sorted(((uid, user) for uid, user in people.items() if user["ms"] > 0),
+                     key=lambda item: (-item[1]["plays" if sort == "plays" else "ms"], -item[1]["ms"], item[0]))
+    entries = []; mine = None
+    for rank, (uid, user) in enumerate(ranking, 1):
+        entry = {"rank": rank, "anonymous": user["anonymous"], "isMe": uid == viewer_id,
+                 "name": None if user["anonymous"] else user["name"],
+                 "ms": user["ms"], "plays": user["plays"], "uniqueTracks": len(user["trackIds"]),
+                 "artists": sorted(user["artists"].values(), key=lambda row: (-row["ms"], row["name"]))[:3],
+                 "tracks": sorted(user["tracks"].values(), key=lambda row: (-row["ms"], row["title"]))[:3]}
+        if uid == viewer_id: mine = entry
+        if rank <= 100: entries.append(entry)
+    return {"days": days, "sort": sort, "updatedAt": now, "entries": entries, "mine": mine, "participants": len(ranking)}

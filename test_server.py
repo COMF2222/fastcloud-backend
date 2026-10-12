@@ -79,6 +79,31 @@ class BrokerTest(unittest.TestCase):
             status, value = self.call('/v1/me/personal', token="fixture-two")
             self.assertEqual(status,200)
             self.assertEqual(value['preferences'],{})
+    def test_leaderboard_routes_hide_identity_use_existing_stats_and_require_sign_in(self):
+        import personal
+        from datetime import datetime, timezone
+        with server.DB_LOCK, server.database() as db:
+            db.execute("INSERT INTO users VALUES (1,'Listener','approved',0)")
+            personal.write(db, 1, {"device": "a" * 32, "stats": [{"day": datetime.now(timezone.utc).date().isoformat(), "trackId": 42, "title": "Song", "artist": "Lil Peep", "genre": "Rock", "ms": 3600000, "plays": 20, "lastPlayed": 1}]})
+        with patch.object(server.RELAY, 'identity', side_effect=server.MediaError(401, 'Sign in')):
+            self.assertEqual(self.call('/v1/leaderboard')[0], 401)
+        with patch.object(server.RELAY, 'identity', return_value=(1, 'fixture')):
+            status, data = self.call('/v1/leaderboard?days=0&sort=time', token='fixture')
+            self.assertEqual(status, 200)
+            self.assertEqual(data['mine']['ms'], 3600000)
+            self.assertNotIn('Listener', json.dumps(data))
+            self.assertNotIn('userId', json.dumps(data))
+            self.assertEqual(self.call('/v1/leaderboard?days=365', token='fixture')[0], 400)
+            status, data = self.call('/v1/me/personal', {'preferences': {'leaderboard_anonymous': False}}, token='fixture', extra_headers={'X-Fastcloud-Preferences': '2'})
+            self.assertEqual(status, 200)
+            self.assertFalse(data['preferences']['leaderboard_anonymous'])
+            self.assertNotIn('leaderboard_anonymous', self.call('/v1/me/personal', token='fixture')[1]['preferences'])
+            self.assertEqual(self.call('/v1/leaderboard', token='fixture')[1]['mine']['name'], 'Listener')
+            request = urllib.request.Request(self.base+'/v1/leaderboard', headers={'Authorization':'OAuth fixture'})
+            with urllib.request.urlopen(request) as response:
+                self.assertEqual(response.headers['Cache-Control'], 'no-store')
+                self.assertIsNone(response.headers.get('Access-Control-Allow-Origin'))
+
     def test_chat_routes_enforce_mutual_following_membership_and_idempotency(self):
         import chat
         with server.DB_LOCK, server.database() as db:
@@ -140,8 +165,8 @@ class BrokerTest(unittest.TestCase):
         self.thread.join()
         self.temp.cleanup()
 
-    def call(self, path, body=None, token=None, release_token=None):
-        headers = {}
+    def call(self, path, body=None, token=None, release_token=None, extra_headers=None):
+        headers = dict(extra_headers or {})
         if token:
             headers["Authorization"] = "OAuth " + token
         if release_token:

@@ -628,11 +628,19 @@ class Handler(BaseHTTPRequestHandler):
                 user_id, _ = RELAY.identity(self.headers.get("Authorization", ""))
                 touch_activity(user_id)
                 return self.reply(200, {"user_id": user_id, "admin": user_id == admin_id()})
+            if path == "/v1/leaderboard" and self.command == "GET":
+                user_id, _ = RELAY.identity(self.headers.get("Authorization", ""))
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                days = int(query.get("days", ["7"])[0]); sort = query.get("sort", ["time"])[0]
+                with DB_LOCK, database() as db:
+                    data = personal.leaderboard(db, user_id, days, sort)
+                return self.reply(200, data)
             if path == "/v1/me/personal" and self.command in ("GET", "POST"):
                 user_id, _ = RELAY.identity(self.headers.get("Authorization", ""))
                 body = self.body(personal.MAX_BODY) if self.command == "POST" else None
                 with DB_LOCK, database() as db:
-                    data = personal.write(db, user_id, body) if body is not None else personal.read(db, user_id)
+                    version = 2 if self.headers.get("X-Fastcloud-Preferences") == "2" else 1
+                    data = personal.write(db, user_id, body, version) if body is not None else personal.read(db, user_id, version)
                 return self.reply(200, data)
             if self.command == "POST" and path == "/v1/oauth/exchange":
                 body = self.body()
