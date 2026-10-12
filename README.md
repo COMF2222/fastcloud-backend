@@ -1,4 +1,4 @@
-# Fastcloud backend
+# Veirune backend
 
 This backend keeps the SoundCloud client secret private, manages access and
 release notifications, and caches public playable HLS audio segments. The UI,
@@ -28,7 +28,7 @@ chooses the working node with the lowest HTTPS latency to SoundCloud.
    `docker compose -f compose.ip.yaml up -d --build`. Both modes require inbound
    ports 80 and 443. The IP mode uses Certbot 5.8 to obtain and renew a public
    short-lived Let's Encrypt IP certificate; the domain mode uses Caddy.
-4. Check `https://<domain-or-ip>/health`. Distributed Fastcloud builds use the
+4. Check `https://<domain-or-ip>/health`. Distributed Veirune builds use the
    built-in server URL; users do not enter it in Account settings. Local HTTP is
    allowed only for `localhost`/`127.0.0.1` development.
 
@@ -38,7 +38,7 @@ authenticated request, the server matches the `/me` permalink to
 `SOUNDCLOUD_ADMIN_PROFILE_URL` and saves the stable numeric SoundCloud user ID.
 Future checks use that ID, so changing the profile name or URL keeps admin
 access. Back up the volume: it holds this ID as well as the allowlist. Administrators
-sign in to Fastcloud with that account and approve users in Account settings.
+sign in to Veirune with that account and approve users in Account settings.
 
 Before public distribution, review SoundCloud's current API Terms of Use and
 publish the privacy information required for the account IDs and names held in
@@ -207,7 +207,7 @@ pending changes on reconnect. Existing local dislikes migrate once; legacy
 ratings use timestamp zero so newer server decisions win.
 
 SoundCloud remains the source of truth for likes, followed accounts and native
-playlists. Fastcloud relays those authenticated API calls; the personal database
+playlists. Veirune relays those authenticated API calls; the personal database
 stores application-specific feedback/preferences/collections and listening
 history summaries, rather than a competing copy of SoundCloud account state.
 
@@ -218,9 +218,9 @@ variable or new database service is needed. Retain and back up the persistent
 approvals volume. Deploy this backend before releasing clients using account
 sync. Existing clients and routes remain compatible.
 
-## Fastcloud chat
+## Veirune chat
 
-Private Fastcloud direct messages use the same approved OAuth identity and SQLite
+Private Veirune direct messages use the same approved OAuth identity and SQLite
 volume as personal data. Chat is activated by the supporting client on startup.
 Both people must be registered in chat and mutually follow each other on
 SoundCloud. Contacts and read-only relationship checks cache for 60 seconds;
@@ -252,3 +252,26 @@ inbox summaries, 200 registered contact candidates, 30 new messages/minute and
 3 seconds for an open visible chat and 15 seconds for the visible inbox badge.
 The shared-IP request throttle has a separate chat bucket, while send quotas are
 per identity. Deploy this backend before distributing the supporting client.
+
+
+## Mobile clients
+
+Veirune Mobile uses the same identity, personal-data, music relay and chat APIs.
+New endpoints provide short-lived PC-assisted OAuth pairing, bounded Yandex import,
+and the desktop-compatible Rust lyrics matcher. Pairing requires desktop 0.4.15
+and a fresh independent grant; the existing PC refresh token is never copied.
+
+Public `GET /v1/mobile/update?platform=android` discovers the latest stable release
+of `COMF2222/fastcloud-mobile`, validates `latest-android.json`, and provides a
+bounded APK relay. The client additionally verifies the downloaded hash, package,
+build and installed signing certificate. APK transfers are capped at 128 MiB,
+two concurrent transfers and a separate per-IP throttle. No new Android secret
+is required. Release metadata caches for two minutes; before the first mobile
+release, the endpoint reports no update rather than an error.
+
+For iOS, optional `FASTCLOUD_IOS_STORE_URL` must be the real App Store app URL.
+Until configured and validated against the bundle ID, iPhone updates remain
+unavailable. Android APK files are never offered to iOS. Run the existing
+`deploy_checked.sh` with the same Compose overlays before distributing Mobile;
+it performs preflight and SQLite backups. The Docker image now also builds the
+Rust lyrics worker, so its initial build takes longer than a Python-only image.

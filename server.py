@@ -1,6 +1,9 @@
 """Small OAuth approval broker for the Fastcloud desktop application."""
 
 import json
+import mobile
+import mobile_updates
+from pairing import PAIRINGS
 import ipaddress
 import os
 import re
@@ -582,6 +585,46 @@ class Handler(BaseHTTPRequestHandler):
                              1200 if chatting else 2400 if relay else 6000 if media else 300 if polling or updates else 120):
             return self.reply(429, {"error": "Too many requests"})
         try:
+            if path == '/v1/mobile/update' and self.command == 'GET':
+                platform = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('platform', ['android'])[0]
+                return self.reply(200, mobile_updates.info(platform))
+            if path.startswith('/v1/mobile/update/apk/') and self.command == 'GET':
+                if not self.throttle('mobile-apk', 3):
+                    return self.reply(429, {'error': 'Too many update downloads; try again shortly'})
+                return mobile_updates.download(self, path.rsplit('/', 1)[-1])
+            if path.startswith('/v1/mobile/pairing/') and self.command == 'POST':
+                body = self.body(8192)
+                action = path.rsplit('/', 1)[-1]
+                if action == 'start':
+                    if body:
+                        raise ValueError('Invalid phone connection request')
+                    if not self.throttle('pairing-start', 5):
+                        return self.reply(429, {'error': 'Too many phone connection attempts'})
+                    return self.reply(200, PAIRINGS.start())
+                if action == 'poll':
+                    if set(body) != {'ticket'}:
+                        raise ValueError('Invalid phone connection request')
+                    status, value = PAIRINGS.poll(body['ticket'], allowed)
+                    return self.reply(status, value)
+                uid, _ = RELAY.identity(self.headers.get('Authorization', ''))
+                if action == 'check' and set(body) == {'code'}:
+                    return self.reply(200, PAIRINGS.check(body['code']))
+                if action == 'approve' and set(body) == {'code', 'refresh_token'}:
+                    def exchange_phone(refresh_token):
+                        tokens = soundcloud('https://secure.soundcloud.com/oauth/token', form={
+                            'grant_type': 'refresh_token', 'client_id': CLIENT_ID,
+                            'client_secret': CLIENT_SECRET, 'refresh_token': refresh_token})
+                        owner, username, slug = profile(tokens['access_token'])
+                        if not allowed(owner, username, slug):
+                            raise MediaError(403, 'Access has not been approved')
+                        return tokens, owner, username, slug
+                    return self.reply(200, PAIRINGS.approve(body['code'], uid,
+                                                          body['refresh_token'], exchange_phone))
+                raise ValueError('Invalid phone connection request')
+            if path in ("/v1/mobile/lyrics", "/v1/mobile/yandex") and self.command == "POST":
+                uid, token = RELAY.identity(self.headers.get("Authorization", ""))
+                body = self.body(32768)
+                return self.reply(200, mobile.lyrics(body, uid, token) if path.endswith("lyrics") else mobile.yandex(body))
             if relay:
                 return RELAY.handle(self, path)
             if media:

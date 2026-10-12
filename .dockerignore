@@ -4,3 +4,4 @@ vpn/config.yaml
 *.sqlite3*
 __pycache__/
 test_server.py
+lyrics-worker/target

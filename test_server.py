@@ -18,6 +18,27 @@ import server
 
 
 class BrokerTest(unittest.TestCase):
+    def test_phone_handoff_uses_fresh_grant_and_keeps_tokens_out_of_public_checks(self):
+        from pairing import Pairings
+        def relay_profile(*_, **__):
+            response = io.BytesIO(b'{"id":7}')
+            response.status = 200
+            return response
+        with patch.object(server.RELAY, 'open', side_effect=relay_profile), patch.object(server.RELAY, 'identities', {}), patch.object(server, 'PAIRINGS', Pairings()), patch.object(server, 'profile', return_value=(7, 'Owner', 'owner')), patch.object(server, 'soundcloud', return_value={'access_token': 'phone-only-access', 'refresh_token': 'phone-only-refresh', 'expires_in': 3600}) as upstream:
+            self.assertTrue(server.allowed(7, 'Owner', 'owner'))
+            status, phone = self.call('/v1/mobile/pairing/start', {})
+            self.assertEqual(status, 200)
+            self.assertNotIn('access_token', phone)
+            self.assertEqual(self.call('/v1/mobile/pairing/check', {'code': phone['code']})[0], 401)
+            self.assertEqual(self.call('/v1/mobile/pairing/check', {'code': phone['code']}, token='pc-access')[0], 200)
+            status, result = self.call('/v1/mobile/pairing/approve', {'code': phone['code'], 'refresh_token': 'fresh-phone-grant'}, token='fresh-phone-access')
+            self.assertEqual(status, 200)
+            self.assertNotIn('access_token', result)
+            self.assertEqual(upstream.call_args.kwargs['form']['refresh_token'], 'fresh-phone-grant')
+            status, value = self.call('/v1/mobile/pairing/poll', {'ticket': phone['ticket']})
+            self.assertEqual((status, value['account_id']), (200, 7))
+            self.assertEqual(value['refresh_token'], 'phone-only-refresh')
+            self.assertEqual(self.call('/v1/mobile/pairing/approve', {'code': phone['code'], 'refresh_token': 'pc-refresh'}, token='pc-access')[0], 409)
     @patch.object(server,'profile',return_value=(1,'Owner','owner'))
     def test_browser_cors_is_only_enabled_for_public_availability(self, profile):
         for path in ('/health','/v1/status','/v1/admin/operations'):
