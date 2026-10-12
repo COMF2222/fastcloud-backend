@@ -10,9 +10,13 @@ import urllib.request
 from concurrency import Flights
 from media import MediaError
 
-REPOSITORY = os.environ.get('FASTCLOUD_MOBILE_REPOSITORY', 'COMF2222/fastcloud-mobile')
+REPOSITORY = os.environ.get('FASTCLOUD_MOBILE_REPOSITORY', 'COMF2222/veirune-mobile')
+# Existing deployments may still configure the original repository name.
+if REPOSITORY == 'COMF2222/fastcloud-mobile':
+    REPOSITORY = 'COMF2222/veirune-mobile'
 if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', REPOSITORY):
     raise RuntimeError('Invalid mobile repository')
+REPOSITORY_ALIASES = (REPOSITORY, 'COMF2222/fastcloud-mobile') if REPOSITORY == 'COMF2222/veirune-mobile' else (REPOSITORY,)
 MAX_APK = 128 * 1024 * 1024
 CACHE = Flights(limit=4, cache_bytes=256 * 1024)
 DOWNLOADS = threading.BoundedSemaphore(2)
@@ -33,11 +37,11 @@ def checked_url(url):
         raise MediaError(502, 'Invalid mobile release address')
     host = parsed.hostname or ''
     if host == 'github.com':
-        if not parsed.path.startswith('/' + REPOSITORY + '/releases/download/'):
+        if not any(parsed.path.startswith('/' + repo + '/releases/download/') for repo in REPOSITORY_ALIASES):
             raise MediaError(502, 'Invalid mobile release repository')
     elif host != 'api.github.com' and host != 'release-assets.githubusercontent.com' and host != 'objects.githubusercontent.com':
         raise MediaError(502, 'Invalid mobile release host')
-    if host == 'api.github.com' and not parsed.path.startswith('/repos/' + REPOSITORY + '/releases/'):
+    if host == 'api.github.com' and not any(parsed.path.startswith('/repos/' + repo + '/releases/') for repo in REPOSITORY_ALIASES):
         raise MediaError(502, 'Invalid mobile release API')
     return url
 
@@ -78,7 +82,8 @@ def validate_manifest(data, tag):
     if type(data.get('bytes')) is not int or not 1 <= data['bytes'] <= MAX_APK:
         raise ValueError('Invalid mobile package size')
     expected = f'https://github.com/{REPOSITORY}/releases/download/{tag}/Veirune-Mobile-{data["version"]}.apk'
-    if data.get('url') != expected:
+    allowed = {f'https://github.com/{repo}/releases/download/{tag}/Veirune-Mobile-{data["version"]}.apk' for repo in REPOSITORY_ALIASES}
+    if data.get('url') not in allowed:
         raise ValueError('Mobile APK must come from the matching release')
     notes = data.get('notes', {})
     if not isinstance(notes, dict) or set(notes) - {'ru', 'en'}:
@@ -86,7 +91,7 @@ def validate_manifest(data, tag):
     for language in notes.values():
         if not isinstance(language, list) or len(language) > 30 or any(not isinstance(line, str) or len(line) > 1000 for line in language):
             raise ValueError('Invalid mobile release notes')
-    return {key: data[key] for key in ('version', 'build', 'packageId', 'sha256', 'signatureSha256', 'bytes', 'url')} | {'notes': notes}
+    return {key: data[key] for key in ('version', 'build', 'packageId', 'sha256', 'signatureSha256', 'bytes')} | {'url': expected, 'notes': notes}
 
 
 def latest_android():

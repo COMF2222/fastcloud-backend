@@ -8,6 +8,19 @@ def manifest(version='0.1.1'):
     return {'version':version,'build':1001,'packageId':'work.comf.fastcloud.mobile','sha256':'a'*64,'signatureSha256':'b'*64,'bytes':4000000,'url':f'https://github.com/{updates.REPOSITORY}/releases/download/v{version}/Veirune-Mobile-{version}.apk','notes':{'ru':['Улучшено воспроизведение'],'en':['Improved playback']}}
 
 class UpdateTests(unittest.TestCase):
+    def test_repository_rename_keeps_published_manifests_usable(self):
+        if updates.REPOSITORY != 'COMF2222/veirune-mobile':
+            self.skipTest('Custom repository has no legacy alias')
+        value=manifest()
+        value['url']=value['url'].replace('/veirune-mobile/', '/fastcloud-mobile/')
+        result=updates.validate_manifest(value,'v0.1.1')
+        self.assertEqual(result['url'],manifest()['url'])
+        updates.checked_url(value['url'])
+        updates.checked_url('https://api.github.com/repos/COMF2222/fastcloud-mobile/releases/latest')
+        for repo in ('veirune-mobile-copy','fastcloud-mobile-copy','veirune','attacker/veirune-mobile'):
+            bad=value['url'].replace('COMF2222/fastcloud-mobile', repo if '/' in repo else 'COMF2222/'+repo)
+            self.assertRaises(ValueError,updates.validate_manifest,{**value,'url':bad},'v0.1.1')
+            self.assertRaises(MediaError,updates.checked_url,bad)
     def test_manifest_identity_hash_and_build_are_verified(self):
         self.assertEqual(updates.validate_manifest(manifest(),'v0.1.1')['build'],1001)
         for change in ({'build':1000},{'version':'0.1.2'},{'packageId':'attacker.app'},{'url':'https://attacker.example/app.apk'},{'sha256':'abc'},{'bytes':updates.MAX_APK+1}):

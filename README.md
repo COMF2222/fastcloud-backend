@@ -262,7 +262,7 @@ and the desktop-compatible Rust lyrics matcher. Pairing requires desktop 0.4.15
 and a fresh independent grant; the existing PC refresh token is never copied.
 
 Public `GET /v1/mobile/update?platform=android` discovers the latest stable release
-of `COMF2222/fastcloud-mobile`, validates `latest-android.json`, and provides a
+of `COMF2222/veirune-mobile`, validates `latest-android.json`, and provides a
 bounded APK relay. The client additionally verifies the downloaded hash, package,
 build and installed signing certificate. APK transfers are capped at 128 MiB,
 two concurrent transfers and a separate per-IP throttle. No new Android secret
