@@ -114,6 +114,67 @@ Alerts are shown in the owner panel, not sent to email or chat. Check backup sta
 
 ## Backups
 
+### Replacement VPS and Windows offsite copies
+
+The replacement host is `root@80.47.238.200`; keep its checkout at
+`/root/fastcloud-backend` so the backup export command has a stable path.
+It uses `compose.ip.yaml` without the VPN overlay. On a fresh Ubuntu host, run
+`bash tools/bootstrap-ubuntu.sh`, then
+`python3 tools/configure_server.py --ip 80.47.238.200` to enter the same SoundCloud
+API application's credentials and the owner's profile URL privately.
+The configuration reserves 5 GiB of free disk and allows 20 GiB of media cache.
+Run `bash deploy_checked.sh -f compose.ip.yaml`, then
+`docker compose -f compose.ip.yaml up -d --build ip-proxy` and
+`python3 tools/check-deployment.py` before publishing clients with the new origin.
+No old account database can be recovered without its disk or backup. Updated
+clients reauthenticate and resend cached personal fields and their own device
+listening counters; old chats and other devices' uncached data are not recreated.
+
+From Windows PowerShell, after deploying the server:
+
+```powershell
+cd D:\projects\fastcloud-backend
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\set-github-server.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\install-pc-backups.ps1 -Destination D:\VeiruneBackups
+```
+
+The first backup must pass download hashing, SQLite integrity, a trial restore
+and encryption/decryption before the installer registers a scheduled task.
+Subsequent copies run hourly and at Windows sign-in, **only while the PC is on,
+online and the same Windows account is signed in**. Missed runs start when
+available. Server snapshots still run every six hours while the backend is
+healthy. These intervals are targets, not guaranteed recovery points. A VPS
+lost before the next successful PC pull loses data since the last PC copy.
+
+Archives include the account SQLite database (users, chats, settings and listening
+history) and `.env`. Git holds source code; certificates are reissued and the media
+cache is expendable, so neither is copied. Server export ZIPs are root-private
+(0700 directory, 0600 files) with eight retained. Windows `.vbackup` files are
+encrypted using DPAPI CurrentUser and the directory permits only that Windows
+account and SYSTEM. Retention keeps eight recent copies plus daily copies for
+30 days within 2 GiB; the newest copy is always kept. Read `last-success.json`
+for the latest checked recovery point and `last-error.txt` for a failed run.
+Copies remain writable by that user; they are not immutable ransomware backups.
+
+DPAPI requires this Windows account's existing encryption profile. These files
+are **not portable password-encrypted backups**: reinstalling Windows or losing
+the profile can make them unreadable. Keep the Windows profile recoverable, or
+arrange separately encrypted portable copies before reinstalling the PC.
+
+To decrypt and validate a selected copy, use a new private directory:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\restore-pc-backup.ps1 -File D:\VeiruneBackups\SELECTED.vbackup -Directory D:\VeiruneRestore
+```
+
+This checks the manifest and SQLite and never overwrites a live database. Treat
+the resulting `.env` as secret. Before restoring production, stop the backend,
+preserve its current database separately and follow the SQLite restore steps
+below; confirm users/chat counts on a staging copy first. Restart the backend and
+verify health, owner access and a conversation before accepting the recovery.
+Recovery time depends on SSH access, reinstall and validation; no RTO is promised.
+Never publish `.env`, decrypted archives or signing keys to GitHub.
+
 SQLite's backup API includes committed WAL data. Each automatic snapshot receives `quick_check` and account-row checks before atomic publication, with a default interval of 6 hours (owner-configurable 1–24 hours). The worker validates an existing latest snapshot after restart. Retention keeps the most recent 8 and daily representatives up to 30 days within 1 GiB, always retaining at least the newest. A separate `/backups` named volume protects against container replacement, **not loss of the VPS**. Local recovery-point target is the selected interval while the worker is healthy; there is no promised recovery time or offsite recovery point until export is configured.
 
 Create and inspect a copy:

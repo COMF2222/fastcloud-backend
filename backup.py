@@ -116,9 +116,11 @@ def worker(operations, stop):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    snapshot = commands.add_parser("create"); snapshot.add_argument("--source", default=os.environ.get("FASTCLOUD_DB_PATH", "/data/approvals.sqlite3")); snapshot.add_argument("--directory", default=os.environ.get("FASTCLOUD_BACKUP_ROOT", "/backups"))
+    snapshot = commands.add_parser("create"); snapshot.add_argument("--source", default=os.environ.get("FASTCLOUD_DB_PATH", "/data/approvals.sqlite3")); snapshot.add_argument("--directory", default=os.environ.get("FASTCLOUD_BACKUP_ROOT", "/backups")); snapshot.add_argument("--prune", action="store_true")
     check = commands.add_parser("check"); check.add_argument("source")
     recover = commands.add_parser("restore"); recover.add_argument("source"); recover.add_argument("--target", required=True)
     args = parser.parse_args()
     result = create(args.source, args.directory) if args.command == "create" else inspect(args.source) if args.command == "check" else restore(args.source, args.target)
+    if args.command == "create" and args.prune:
+        result["retention"] = retention(args.directory)
     print(json.dumps(result))
