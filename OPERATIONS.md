@@ -142,7 +142,10 @@ The first backup must pass download hashing, SQLite integrity, a trial restore
 and encryption/decryption before the installer registers a scheduled task.
 Subsequent copies run hourly and at Windows sign-in, **only while the PC is on,
 online and the same Windows account is signed in**. Missed runs start when
-available. Server snapshots still run every six hours while the backend is
+available. The scheduled action uses the windowless Windows Script Host and
+starts PowerShell hidden, so automatic backups do not open a console. Rerun the
+installer to replace an older task; it does not create a second task.
+Server snapshots still run every six hours while the backend is
 healthy. These intervals are targets, not guaranteed recovery points. A VPS
 lost before the next successful PC pull loses data since the last PC copy.
 

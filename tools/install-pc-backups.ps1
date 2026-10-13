@@ -9,11 +9,13 @@ Set-VeirunePrivateDirectory $runtime
 Copy-Item -LiteralPath "$PSScriptRoot\..\backup.py" -Destination (Join-Path $runtime 'backup.py') -Force
 $scripts = Join-Path $runtime 'tools'
 Set-VeirunePrivateDirectory $scripts
-foreach ($name in @('backup-common.ps1','backup-to-pc.ps1','restore-pc-backup.ps1')) {Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $scripts $name) -Force}
+foreach ($name in @('backup-common.ps1','backup-to-pc.ps1','restore-pc-backup.ps1','run-backup-hidden.vbs')) {Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $scripts $name) -Force}
 if ($Server -notmatch '^[a-z_][a-z0-9_-]*@[a-z0-9][a-z0-9.-]+$' -or $Destination.Contains('"')) {throw 'Invalid scheduled task arguments'}
 $executable = (Get-Process -Id $PID).Path
-$argument = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + (Join-Path $scripts 'backup-to-pc.ps1') + '" -Server "' + $Server + '" -Destination "' + [IO.Path]::GetFullPath($Destination) + '"'
-$action = New-ScheduledTaskAction -Execute $executable -Argument $argument
+$argument = '//B //NoLogo "' + (Join-Path $scripts 'run-backup-hidden.vbs') + '" "' + $executable + '" "' + (Join-Path $scripts 'backup-to-pc.ps1') + '" "' + $Server + '" "' + [IO.Path]::GetFullPath($Destination) + '"'
+$hostExecutable = Join-Path $env:SystemRoot 'System32\wscript.exe'
+if (-not (Test-Path -LiteralPath $hostExecutable)) {throw 'Windows Script Host is required for the hidden backup launcher'}
+$action = New-ScheduledTaskAction -Execute $hostExecutable -Argument $argument
 $daily = New-ScheduledTaskTrigger -Daily -At '00:05'
 $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days 1)
 $daily.Repetition = $repeat.Repetition

@@ -11,13 +11,24 @@ function Unprotect-VeiruneBytes([byte[]]$Bytes) {
 function Set-VeirunePrivateDirectory([string]$Path) {
     [void][IO.Directory]::CreateDirectory($Path)
     $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    $acl = New-Object Security.AccessControl.DirectorySecurity
+    # Read only the existing ordinary ACL; a fresh security descriptor can
+    # make Windows PowerShell attempt to replace auditing without permission.
+    $acl = Get-Acl -LiteralPath $Path
+    foreach ($rule in @($acl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier]))) {
+        $acl.RemoveAccessRuleSpecific($rule)
+    }
     $acl.SetOwner($owner)
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($sid in @($owner, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
         $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
     }
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    # Persist only changed sections; Set-Acl can request SACL privileges on an
+    # existing protected directory in Windows PowerShell 5.1.
+    if ([IO.Directory].GetMethods().Name -contains 'SetAccessControl') {
+        [IO.Directory]::SetAccessControl($Path,$acl)
+    } else {
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($Path),$acl)
+    }
 }
 function Expand-VeiruneBundle([byte[]]$Bytes, [string]$Directory) {
     if (Test-Path -LiteralPath $Directory) {throw 'Restore into a new directory; existing files are never overwritten.'}
