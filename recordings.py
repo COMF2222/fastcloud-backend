@@ -53,6 +53,10 @@ def playable(track):
     return (track.get("sharing") == "public" and track.get("access") == "playable"
             and track.get("streamable") is True and str(track.get("policy", "")).upper() not in ("BLOCK", "BLOCKED", "SNIP", "PREVIEW"))
 
+def preview(track):
+    return (str(track.get("access", "")).casefold() == "preview"
+            or str(track.get("policy", "")).upper() in ("SNIP", "PREVIEW"))
+
 
 def score(source, candidate):
     if not playable(candidate): return None
@@ -73,9 +77,14 @@ def score(source, candidate):
 
 def urn(track):
     value = track.get("id")
-    if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 2**53:
-        return f"soundcloud:tracks:{value}"
-    return None
+    identifier = value if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 2**53 else None
+    raw = track.get("urn")
+    if raw is not None:
+        match = re.fullmatch(r"soundcloud:tracks:([1-9][0-9]{0,15})", raw) if isinstance(raw, str) else None
+        if not match or not 0 < int(match[1]) < 2**53: return None
+        if identifier is not None and identifier != int(match[1]): return None
+        return raw
+    return f"soundcloud:tracks:{identifier}" if identifier is not None else None
 
 
 class RecordingMatches:
@@ -99,7 +108,8 @@ class RecordingMatches:
             raise
 
     def find(self, source_urn, source, token, user_id):
-        if (source.get("sharing") != "public" or source.get("access") != "preview"
+        if (source.get("sharing") != "public" or not preview(source)
+                or str(source.get("access", "")).casefold() in ("block", "blocked")
                 or str(source.get("policy", "")).upper() in ("BLOCK", "BLOCKED")
                 or not duration(source) or duration(source) <= 30000): return None
         fingerprint = hashlib.sha256(json.dumps([words(source.get("title")), words(artist(source)), duration(source), metadata_of(source)], sort_keys=True).encode()).hexdigest()

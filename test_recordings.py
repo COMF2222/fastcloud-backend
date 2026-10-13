@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from media import KeyedLocks, MediaCache, MediaError
-from recordings import RecordingMatches, score
+from recordings import RecordingMatches, score, urn
 
 
 def recording(identifier=8, **changes):
@@ -92,6 +92,26 @@ class RecordingTests(unittest.TestCase):
         self.assertNotIn(b"first-user-secret", contents)
         self.assertNotIn(b"second-user-secret", contents)
         self.assertNotIn(b"https://", contents)
+
+    def test_urn_only_search_results_can_be_verified_and_reused(self):
+        self.target.pop("id")
+        self.target["urn"] = "soundcloud:tracks:8"
+        self.assertEqual(self.find()["urn"], "soundcloud:tracks:8")
+        self.service = self.new_service()
+        self.calls.clear()
+        self.assertEqual(self.find("another-user", 43)["urn"], "soundcloud:tracks:8")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_preview_policy_is_recognized_even_when_access_is_missing_or_stale(self):
+        for access in (None, "playable"):
+            self.source["access"] = access
+            self.assertEqual(self.find()["id"], 8)
+
+    def test_recording_urn_rejects_wrong_types_mismatched_ids_and_unsafe_numbers(self):
+        for value in ({"urn": "soundcloud:users:8"}, {"urn": "https://example.com/8"},
+                      {"urn": "soundcloud:tracks:0"}, {"urn": "soundcloud:tracks:9007199254740993"},
+                      {"id": 8, "urn": "soundcloud:tracks:9"}, {"id": True}):
+            with self.subTest(value=value): self.assertIsNone(urn(value))
 
     def test_deleted_mapping_is_replaced_instead_of_serving_stale_audio(self):
         self.find(); self.deleted.add(8)

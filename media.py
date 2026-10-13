@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from upstream import open_read
-from recordings import RecordingMatches, duration as recording_duration, urn as recording_urn
+from recordings import RecordingMatches, duration as recording_duration, urn as recording_urn, preview as recording_preview
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -224,7 +224,7 @@ class MediaCache:
             path = "/tracks/" + urllib.parse.quote(urn, safe="")
             track = self.api_json("https://api.soundcloud.com" + path, token=token)
             replacement = None
-            if track.get("sharing") == "public" and track.get("access") == "preview":
+            if track.get("sharing") == "public" and recording_preview(track):
                 replacement = self.matches.find(urn, track, token, user_id)
                 if replacement:
                     track = replacement
